@@ -30,7 +30,7 @@ import { parseUserAgent } from "./userAgentParser";
 export const appRouter = router({
   system: systemRouter,
   auth: router({
-    me: publicProcedure.query(opts => opts.ctx.user),
+    me: publicProcedure.query(() => null), // Zawsze zwraca null (niezalogowany)
     logout: publicProcedure.mutation(({ ctx }) => {
       const cookieOptions = getSessionCookieOptions(ctx.req);
       ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
@@ -70,14 +70,14 @@ export const appRouter = router({
         browser: z.string().optional(),
       }))
       .mutation(async ({ input, ctx }) => {
-        // TYMCZASOWO: pomiń autoryzację dla testów
+        // Ustaw domyślnego użytkownika dla wszystkich
         ctx.user = { 
           id: 1, 
-          openId: "test-user", 
-          name: "Test", 
-          email: "test@test.com", 
-          loginMethod: "test", 
-          role: "admin", 
+          openId: "public-user", 
+          name: "Gość", 
+          email: "guest@example.com", 
+          loginMethod: "public", 
+          role: "user", 
           createdAt: new Date(), 
           updatedAt: new Date(), 
           lastSignedIn: new Date() 
@@ -115,27 +115,21 @@ export const appRouter = router({
           input.angle >= correctAngle - tolerance &&
           input.angle <= correctAngle + tolerance;
 
-        // Pobieramy dane geolokalizacyjne dla IP
         let geoData = null;
         if (ipAddress && ipAddress !== "unknown") {
           try {
             geoData = await fetchGeolocation(ipAddress);
-            console.log("[Geolocation] Data fetched:", JSON.stringify(geoData));
           } catch (e) {
-            console.error("[Geolocation] Error fetching geo data:", e);
+            console.error("[Geolocation] Error:", e);
           }
         }
 
-        // Parsujemy User-Agent
         const userAgent = ctx.req.headers["user-agent"] || "unknown";
         const parsedUA = parseUserAgent(userAgent);
 
-        // Jeśli przysłano z frontendu – NADPISUJEMY
         if (input.browser) {
           parsedUA.browserFamily = input.browser;
-          console.log("[Browser] Override z frontendu:", input.browser);
         }
-        console.log("[UserAgent] Parsed:", JSON.stringify(parsedUA));
 
         const record = await getOrCreateAttemptRecord(ipAddress);
         const attemptNumber = (record.failedAttempts || 0) + 1;
@@ -150,9 +144,6 @@ export const appRouter = router({
             userAgent,
             geoData || undefined,
             parsedUA
-          );
-          await recordAttemptWithTracking(ipAddress, input.angle, true, attemptNumber, userAgent).catch(err =>
-            console.error("[Tracking] Error:", err)
           );
           return {
             success: true,
@@ -169,9 +160,6 @@ export const appRouter = router({
             userAgent,
             geoData || undefined,
             parsedUA
-          );
-          await recordAttemptWithTracking(ipAddress, input.angle, false, attemptNumber, userAgent).catch(err =>
-            console.error("[Tracking] Error:", err)
           );
           return {
             success: false,

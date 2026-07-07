@@ -10,11 +10,23 @@ const t = initTRPC.context<TrpcContext>().create({
 export const router = t.router;
 export const publicProcedure = t.procedure;
 
+// Tymczasowo wyłączamy wymóg autoryzacji
 const requireUser = t.middleware(async opts => {
   const { ctx, next } = opts;
 
+  // Jeśli nie ma użytkownika, tworzymy domyślnego
   if (!ctx.user) {
-    throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+    ctx.user = {
+      id: 1,
+      openId: "public-user",
+      name: "Gość",
+      email: "guest@example.com",
+      loginMethod: "public",
+      role: "user",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      lastSignedIn: new Date()
+    };
   }
 
   return next({
@@ -26,7 +38,6 @@ const requireUser = t.middleware(async opts => {
 });
 
 export const protectedProcedure = t.procedure.use(requireUser);
-
 export const adminProcedure = t.procedure.use(
   t.middleware(async opts => {
     const { ctx, next } = opts;
