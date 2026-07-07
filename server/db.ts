@@ -1,14 +1,25 @@
 import { eq, desc } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
+import mysql from "mysql2/promise";
 import { InsertUser, users, angleAttempts, attemptHistory } from "../drizzle/schema";
 import { ENV } from './_core/env';
 
 let _db: ReturnType<typeof drizzle> | null = null;
+let _connection: mysql.Connection | null = null;
 
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      // Tworzymy połączenie z obsługą SSL
+      const connection = await mysql.createConnection({
+        uri: process.env.DATABASE_URL,
+        ssl: {
+          rejectUnauthorized: false // Tymczasowo dla testów
+        }
+      });
+      _connection = connection;
+      _db = drizzle(connection);
+      console.log("[Database] Connected successfully");
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
@@ -17,6 +28,7 @@ export async function getDb() {
   return _db;
 }
 
+// Reszta kodu pozostaje bez zmian...
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) {
     throw new Error("User openId is required for upsert");
@@ -92,28 +104,33 @@ export async function getOrCreateAttemptRecord(ipAddress: string) {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
 
-  const existing = await db
-    .select()
-    .from(angleAttempts)
-    .where(eq(angleAttempts.ipAddress, ipAddress))
-    .limit(1);
+  try {
+    const existing = await db
+      .select()
+      .from(angleAttempts)
+      .where(eq(angleAttempts.ipAddress, ipAddress))
+      .limit(1);
 
-  if (existing.length > 0) {
-    return existing[0];
+    if (existing.length > 0) {
+      return existing[0];
+    }
+
+    await db.insert(angleAttempts).values({
+      ipAddress,
+      failedAttempts: 0,
+    });
+
+    const created = await db
+      .select()
+      .from(angleAttempts)
+      .where(eq(angleAttempts.ipAddress, ipAddress))
+      .limit(1);
+
+    return created[0];
+  } catch (error) {
+    console.error("[Database] Error in getOrCreateAttemptRecord:", error);
+    throw error;
   }
-
-  await db.insert(angleAttempts).values({
-    ipAddress,
-    failedAttempts: 0,
-  });
-
-  const created = await db
-    .select()
-    .from(angleAttempts)
-    .where(eq(angleAttempts.ipAddress, ipAddress))
-    .limit(1);
-
-  return created[0];
 }
 
 export async function isIpLocked(ipAddress: string): Promise<boolean> {
@@ -229,9 +246,6 @@ export async function unlockIp(ipAddress: string): Promise<void> {
   }
 }
 
-/**
- * 🔥 ROZSZERZONA WERSJA – zapisuje wszystkie dane geolokalizacyjne + User-Agent
- */
 export async function recordAttemptHistory(
   ipAddress: string,
   angle: number,
@@ -261,9 +275,6 @@ export async function recordAttemptHistory(
     return;
   }
 
-  console.log("[DB] recordAttemptHistory received geoData:", JSON.stringify(geoData));
-  console.log("[DB] recordAttemptHistory received parsedUA:", JSON.stringify(parsedUA));
-
   try {
     await db.insert(attemptHistory).values({
       ipAddress,
@@ -280,7 +291,6 @@ export async function recordAttemptHistory(
       as: geoData?.as || null,
       timezone: geoData?.timezone || null,
       zip: geoData?.zip || null,
-      // 🔥 DANE Z USER-AGENT
       browserFamily: parsedUA?.browserFamily || null,
       osFamily: parsedUA?.osFamily || null,
       deviceType: parsedUA?.deviceType || null,
