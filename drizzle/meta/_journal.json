@@ -1,0 +1,41 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1777888654840,
+      "tag": "0000_smiling_argent",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1777889202988,
+      "tag": "0001_melodic_gorilla_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1778873030738,
+      "tag": "0002_redundant_barracuda",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1780409006661,
+      "tag": "0003_giant_karen_page",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1782904018117,
+      "tag": "0004_familiar_the_call",
+      "breakpoints": true
+    }
+  ]
+}
