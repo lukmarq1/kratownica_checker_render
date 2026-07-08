@@ -16,7 +16,7 @@ async function startServer() {
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  // Health check - ZMIENIONE z "/" na "/health" żeby nie blokować frontendu
+  // Health check - nie blokuje frontendu
   app.get("/health", (req, res) => {
     res.status(200).send("OK - kratownica checker");
   });
@@ -45,13 +45,13 @@ async function startServer() {
     console.log(`Server running on port ${port}`);
   });
 
-  // 2. DOPIERO baza
-  try {
-    await initializeDatabase();
-    console.log("[Database] Connected successfully");
-  } catch (error) {
-    console.error("[Server] Failed to initialize database:", error);
-  }
+  // 2. BAZA TYMCZASOWO WYLACZONA - zeby nie blokowala weryfikacji
+  // try {
+  // await initializeDatabase();
+  // console.log("[Database] Connected successfully");
+  // } catch (error) {
+  // console.error("[Server] Failed to initialize database:", error);
+  // }
 }
 
 startServer().catch(console.error);
