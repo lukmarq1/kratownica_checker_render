@@ -12,19 +12,14 @@ function findPublicPath(): string {
     path.resolve(process.cwd(), "public"),
     path.resolve(process.cwd(), "..", "dist", "public"),
     path.resolve(process.cwd(), "src", "dist", "public"),
-    path.resolve(__dirname, "public"),
-    path.resolve(__dirname, "..", "public"),
-    path.resolve(__dirname, "..", "..", "dist", "public"),
     "/opt/render/project/dist/public",
     "/opt/render/project/src/dist/public",
   ];
-
   for (const p of candidates) {
     if (fs.existsSync(p) && fs.existsSync(path.join(p, "index.html"))) {
       return p;
     }
   }
-  // fallback - pierwszy który istnieje
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
   }
@@ -46,10 +41,8 @@ async function getApp() {
 
   const publicPath = findPublicPath();
   console.log("[Static] CWD:", process.cwd());
-  console.log("[Static] __dirname:", __dirname);
   console.log("[Static] Serving from:", publicPath);
   console.log("[Static] Exists:", fs.existsSync(publicPath));
-  console.log("[Static] Index exists:", fs.existsSync(path.join(publicPath, "index.html")));
 
   app.use(express.static(publicPath));
 
