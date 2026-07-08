@@ -11,24 +11,21 @@ async function startServer() {
   const app = express();
   const server = createServer(app);
 
-  // Render daje PORT=10000 automatycznie
   const port = parseInt(process.env.PORT || "10000");
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  // Health check - wymagany przez Render
-  app.get("/", (req, res) => {
+  // Health check - ZMIENIONE z "/" na "/health" żeby nie blokować frontendu
+  app.get("/health", (req, res) => {
     res.status(200).send("OK - kratownica checker");
   });
 
-  // Twoje istniejące rejestracje - ZOSTAW JE
   // @ts-ignore
   if (typeof registerStorageProxy!== "undefined") registerStorageProxy(app);
   // @ts-ignore
   if (typeof registerOAuthRoutes!== "undefined") registerOAuthRoutes(app);
 
-  // tRPC
   app.use(
     "/api/trpc",
     createExpressMiddleware({
@@ -43,12 +40,12 @@ async function startServer() {
     serveStatic(app);
   }
 
-  // 1. NAJPIERW otwórz port - żeby Render go od razu wykrył
+  // 1. NAJPIERW port
   server.listen(port, "0.0.0.0", () => {
     console.log(`Server running on port ${port}`);
   });
 
-  // 2. DOPIERO potem baza danych
+  // 2. DOPIERO baza
   try {
     await initializeDatabase();
     console.log("[Database] Connected successfully");
