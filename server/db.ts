@@ -3,32 +3,56 @@ import { drizzle } from "drizzle-orm/mysql2";
 import mysql from "mysql2/promise";
 import { InsertUser, users, angleAttempts, attemptHistory } from "../drizzle/schema";
 import { ENV } from './_core/env';
+import { URL } from "url";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 let _connection: mysql.Connection | null = null;
 
 export async function getDb() {
+  console.log("[Database] Attempting to connect...");
+  console.log("[Database] DATABASE_URL exists:", !!process.env.DATABASE_URL);
+  
   if (!_db && process.env.DATABASE_URL) {
     try {
-      // Tworzymy połączenie z obsługą SSL
+      const url = new URL(process.env.DATABASE_URL);
+      console.log("[Database] Host:", url.hostname);
+      console.log("[Database] Port:", url.port);
+      console.log("[Database] Database:", url.pathname.slice(1));
+      console.log("[Database] User:", url.username);
+      
+      // Tworzymy połączenie z jawnym SSL i dodatkowymi opcjami
       const connection = await mysql.createConnection({
-        uri: process.env.DATABASE_URL,
+        host: url.hostname,
+        port: parseInt(url.port || "3306"),
+        user: url.username,
+        password: url.password,
+        database: url.pathname.slice(1) || "defaultdb",
         ssl: {
-          rejectUnauthorized: false // Tymczasowo dla testów
-        }
+          rejectUnauthorized: false
+        },
+        connectTimeout: 30000,
+        // Dodatkowe opcje dla Aiven
+        flags: [
+          'COMPRESS',
+          'MULTI_STATEMENTS'
+        ]
       });
+      
+      console.log("[Database] Connection created, testing...");
+      const [result] = await connection.query("SELECT 1");
+      console.log("[Database] Test query successful!", result);
+      
       _connection = connection;
       _db = drizzle(connection);
       console.log("[Database] Connected successfully");
     } catch (error) {
-      console.warn("[Database] Failed to connect:", error);
+      console.error("[Database] Failed to connect:", error);
       _db = null;
     }
   }
   return _db;
 }
 
-// Reszta kodu pozostaje bez zmian...
 export async function upsertUser(user: InsertUser): Promise<void> {
   if (!user.openId) {
     throw new Error("User openId is required for upsert");
@@ -105,6 +129,8 @@ export async function getOrCreateAttemptRecord(ipAddress: string) {
   if (!db) throw new Error("Database not available");
 
   try {
+    console.log("[getOrCreateAttemptRecord] Checking for IP:", ipAddress);
+    
     const existing = await db
       .select()
       .from(angleAttempts)
@@ -112,9 +138,11 @@ export async function getOrCreateAttemptRecord(ipAddress: string) {
       .limit(1);
 
     if (existing.length > 0) {
+      console.log("[getOrCreateAttemptRecord] Found existing record");
       return existing[0];
     }
 
+    console.log("[getOrCreateAttemptRecord] Creating new record for IP:", ipAddress);
     await db.insert(angleAttempts).values({
       ipAddress,
       failedAttempts: 0,
@@ -126,9 +154,10 @@ export async function getOrCreateAttemptRecord(ipAddress: string) {
       .where(eq(angleAttempts.ipAddress, ipAddress))
       .limit(1);
 
+    console.log("[getOrCreateAttemptRecord] Created record successfully");
     return created[0];
   } catch (error) {
-    console.error("[Database] Error in getOrCreateAttemptRecord:", error);
+    console.error("[getOrCreateAttemptRecord] Error:", error);
     throw error;
   }
 }
