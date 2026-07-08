@@ -43,10 +43,10 @@ export default function AdminDashboard() {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-4xl font-bold font-mono tracking-tighter text-slate-100">PANEL ADMINISTRATORA</h1>
-            <p className="text-slate-400 text-sm mt-1 font-mono">Historia pr\u00F3b</p>
+            <p className="text-slate-400 text-sm mt-1 font-mono">{"Historia pr\u00F3b"}</p>
           </div>
           <div className="flex gap-2">
-            <Button onClick={() => (window.location.href = "/")} variant="outline" className="border-slate-600 text-slate-300 gap-2"><ArrowLeft className="w-4 h-4" />Wr\u00F3\u0107</Button>
+            <Button onClick={() => (window.location.href = "/")} variant="outline" className="border-slate-600 text-slate-300 gap-2"><ArrowLeft className="w-4 h-4" />{"Wr\u00F3\u0107"}</Button>
             <Button onClick={() => { sessionStorage.removeItem("adminPin"); setPinVerified(false); }} variant="outline" className="border-slate-600 text-slate-300 gap-2"><LogOut className="w-4 h-4" />Wyloguj</Button>
           </div>
         </div>
@@ -68,13 +68,13 @@ export default function AdminDashboard() {
 
         <Card className="bg-slate-800 border-slate-700 overflow-visible">
           <div className="p-6 overflow-visible">
-            <div className="flex items-center gap-2 mb-6"><MapPin className="w-5 h-5 text-cyan-400" /><h2 className="text-lg font-bold text-white font-mono">Historia pr\u00F3b</h2></div>
+            <div className="flex items-center gap-2 mb-6"><MapPin className="w-5 h-5 text-cyan-400" /><h2 className="text-lg font-bold text-white font-mono">{"Historia pr\u00F3b"}</h2></div>
             <div className="overflow-visible">
               <table className="w-full text-sm font-mono">
                 <thead>
                   <tr className="border-b-2 border-slate-600">
                     <th className="text-left py-3 px-3 text-slate-400">IP</th>
-                    <th className="text-left py-3 px-3 text-slate-400">K\u0105t</th>
+                    <th className="text-left py-3 px-3 text-slate-400">{"K\u0105t"}</th>
                     <th className="text-left py-3 px-3 text-slate-400">Status</th>
                     <th className="text-left py-3 px-3 text-slate-400">Lokalizacja</th>
                     <th className="text-left py-3 px-3 text-slate-400">Czas</th>
@@ -105,22 +105,22 @@ export default function AdminDashboard() {
                                 <div className="w-2 h-2 rounded-full bg-[#22c55e] shadow-[0_0_8px_#22c55e]"></div>
                               </div>
                               <div className="p-[14px_20px]">
-                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F30D}"} Kraj</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.country} {"\u{1F1F5}\u{1F1F1}"}</span></div>
-                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F3D9}\uFE0F"} Miasto</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.city || "\u2014"}</span></div>
-                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4EE}"} Kod</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.zip || "\u2014"}</span></div>
-                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F550}"} Strefa</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.timezone || "\u2014"}</span></div>
-                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4E1}"} ISP</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words leading-[1.35]">{a.isp || "\u2014"}</span></div>
-                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F3E2}"} Org</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words leading-[1.35]">{a.org || "\u2014"}</span></div>
-                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F522}"} AS</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.as || "\u2014"}</span></div>
-                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4CD}"} Coords</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.latitude? `${a.latitude}, ${a.longitude}` : "\u2014"}</span></div>
+                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F30D} Kraj"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.country}</span></div>
+                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F3D9}\uFE0F Miasto"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.city || "\u2014"}</span></div>
+                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4EE} Kod"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.zip || "\u2014"}</span></div>
+                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F550} Strefa"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.timezone || "\u2014"}</span></div>
+                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4E1} ISP"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words leading-[1.35]">{a.isp || "\u2014"}</span></div>
+                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F3E2} Org"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words leading-[1.35]">{a.org || "\u2014"}</span></div>
+                                <div className="flex justify-between py- border-b border-white/[0.06] gap-4"><span className="text- text-[#94a3b8]">{"\u{1F522} AS"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right max-w- break-words">{a.as || "\u2014"}</span></div>
+                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4CD} Coords"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.latitude? `${a.latitude}, ${a.longitude}` : "\u2014"}</span></div>
                               </div>
                               <div className="h-px bg-[#334155] mx-5"></div>
                               <div className="p-[10px_20px_0]">
-                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F310}"} Przegl\u0105darka</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.browserFamily || "\u2014"}</span></div>
-                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4BB}"} System</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.osFamily || "Unknown"}</span></div>
-                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4F1}"} Urz\u0105dzenie</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.deviceType || "desktop"}</span></div>
+                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F310} Przegl\u0105darka"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.browserFamily || "\u2014"}</span></div>
+                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4BB} System"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.osFamily || "Unknown"}</span></div>
+                                <div className="flex justify-between py- gap-4"><span className="text- text-[#94a3b8]">{"\u{1F4F1} Urz\u0105dzenie"}</span><span className="text-[12.5px] font-medium text-[#e2e8f0] text-right">{a.deviceType || "desktop"}</span></div>
                               </div>
-                              <div className="p-[14px_20px_20px]"><a href={mapUrl} target="_blank" rel="noreferrer" className="flex w-full h- items-center justify-center gap-2 bg-[#0ea5e9] hover:bg-[#0284c7] text-white rounded- text- font-bold no-underline transition-colors">{"\u{1F5FA}\uFE0F"} Zobacz na mapie</a></div>
+                              <div className="p-[14px_20px_20px]"><a href={mapUrl} target="_blank" rel="noreferrer" className="flex w-full h- items-center justify-center gap-2 bg-[#0ea5e9] hover:bg-[#0284c7] text-white rounded- text- font-bold no-underline transition-colors">{"\u{1F5FA}\uFE0F Zobacz na mapie"}</a></div>
                             </div>
                           </div>
                         </td>
@@ -135,7 +135,7 @@ export default function AdminDashboard() {
             <div className="flex justify-between items-center mt-8 pt-4 border-t border-slate-700">
               <Button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0} variant="outline" className="border-slate-600 text-slate-300">Poprzednia</Button>
               <span className="text-slate-400 font-mono text-sm">Strona {page + 1}</span>
-              <Button onClick={() => setPage(page + 1)} disabled={attempts.length < pageSize} variant="outline" className="border-slate-600 text-slate-300">Nast\u0119pna</Button>
+              <Button onClick={() => setPage(page + 1)} disabled={attempts.length < pageSize} variant="outline" className="border-slate-600 text-slate-300">{"Nast\u0119pna"}</Button>
             </div>
           </div>
         </Card>
