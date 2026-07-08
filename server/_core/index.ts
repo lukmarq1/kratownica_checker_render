@@ -1,9 +1,35 @@
 import "dotenv/config";
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
+
+function findPublicPath(): string {
+  const candidates = [
+    path.resolve(process.cwd(), "dist", "public"),
+    path.resolve(process.cwd(), "public"),
+    path.resolve(process.cwd(), "..", "dist", "public"),
+    path.resolve(process.cwd(), "src", "dist", "public"),
+    path.resolve(__dirname, "public"),
+    path.resolve(__dirname, "..", "public"),
+    path.resolve(__dirname, "..", "..", "dist", "public"),
+    "/opt/render/project/dist/public",
+    "/opt/render/project/src/dist/public",
+  ];
+
+  for (const p of candidates) {
+    if (fs.existsSync(p) && fs.existsSync(path.join(p, "index.html"))) {
+      return p;
+    }
+  }
+  // fallback - pierwszy który istnieje
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return candidates[0];
+}
 
 async function getApp() {
   const app = express();
@@ -18,9 +44,12 @@ async function getApp() {
     })
   );
 
-  // Render: process.cwd() = /opt/render/project
-  const publicPath = path.resolve(process.cwd(), "dist", "public");
+  const publicPath = findPublicPath();
+  console.log("[Static] CWD:", process.cwd());
+  console.log("[Static] __dirname:", __dirname);
   console.log("[Static] Serving from:", publicPath);
+  console.log("[Static] Exists:", fs.existsSync(publicPath));
+  console.log("[Static] Index exists:", fs.existsSync(path.join(publicPath, "index.html")));
 
   app.use(express.static(publicPath));
 
@@ -28,12 +57,11 @@ async function getApp() {
     if (req.path.startsWith("/api/")) {
       return res.status(404).json({ error: "Not found" });
     }
-    res.sendFile(path.join(publicPath, "index.html"), (err) => {
-      if (err) {
-        console.error("Failed to send index.html:", err.message);
-        res.status(404).send("Frontend not built");
-      }
-    });
+    const indexFile = path.join(publicPath, "index.html");
+    if (!fs.existsSync(indexFile)) {
+      return res.status(404).send(`Frontend not found. Checked: ${publicPath}`);
+    }
+    res.sendFile(indexFile);
   });
 
   return app;
