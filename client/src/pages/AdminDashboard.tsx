@@ -2,7 +2,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { trpc } from "@/lib/trpc";
 import { useState } from "react";
-import { BarChart3, Lock, Users, CheckCircle2, XCircle, ArrowLeft, LogOut, MapPin, Info } from "lucide-react";
+import { CheckCircle2, XCircle, ArrowLeft, LogOut, MapPin, Lock } from "lucide-react";
 import AdminLogin from "./AdminLogin";
 
 function UnlockButton({ ipAddress }: { ipAddress: string }) {
@@ -30,13 +30,11 @@ export default function AdminDashboard() {
   const [pinVerified, setPinVerified] = useState(() =>!!sessionStorage.getItem("adminPin"));
   const [page, setPage] = useState(0);
   const pageSize = 50;
-  const statsQuery = trpc.admin.getStats.useQuery(undefined, { enabled: pinVerified });
   const attemptsQuery = trpc.admin.getAttempts.useQuery({ limit: pageSize, offset: page * pageSize }, { enabled: pinVerified });
   const lockedIPsQuery = trpc.admin.getLockedIPs.useQuery(undefined, { enabled: pinVerified });
 
   if (!pinVerified) return <AdminLogin onLoginSuccess={() => setPinVerified(true)} />;
   const handleLogout = () => { sessionStorage.removeItem("adminPin"); setPinVerified(false); };
-  const stats = statsQuery.data || { totalAttempts: 0, uniqueIps: 0, successfulAttempts: 0, failedAttempts: 0, currentlyLockedIps: 0 };
   const attempts = attemptsQuery.data || [];
   const lockedIPs = lockedIPsQuery.data || [];
 
@@ -73,7 +71,7 @@ export default function AdminDashboard() {
         <Card className="bg-slate-800 border-slate-700 overflow-visible">
           <div className="p-6 overflow-visible">
             <div className="flex items-center gap-2 mb-6"><MapPin className="w-5 h-5 text-cyan-400" /><h2 className="text-xl font-bold text-white font-mono">Historia prob</h2></div>
-            <div className="w-full overflow-visible">
+            <div className="w-full overflow-x-auto overflow-y-visible">
               <table className="w-full text-sm font-mono">
                 <thead><tr className="border-b-2 border-slate-600"><th className="text-left py-3 px-3 text-slate-400">IP</th><th className="text-left py-3 px-3 text-slate-400">Kat</th><th className="text-left py-3 px-3 text-slate-400">Status</th><th className="text-left py-3 px-3 text-slate-400">Lokalizacja</th><th className="text-left py-3 px-3 text-slate-400">Czas</th><th className="text-left py-3 px-3 text-slate-400">Akcja</th></tr></thead>
                 <tbody>
@@ -87,17 +85,16 @@ export default function AdminDashboard() {
                         <td className="py-3 px-3">{attempt.isCorrect === 1? <span className="text-green-400 flex gap-1 font-bold"><CheckCircle2 className="w-4 h-4" /> OK</span> : <span className="text-red-400 flex gap-1 font-bold"><XCircle className="w-4 h-4" /> FAIL</span>}</td>
 
                         <td className="py-3 px-3 overflow-visible">
-                          <div className="group relative inline-block overflow-visible">
+                          <div className="group relative inline-block">
                             <span className="flex items-center gap-1.5 cursor-help border-b border-dotted border-slate-500 hover:text-cyan-300 transition-colors">
                               <span>{getCountryFlag(attempt.country)}</span>
                               <span className="text-slate-200">{attempt.country}</span>
                               {attempt.city && <span className="text-slate-400 text-xs">({attempt.city})</span>}
                             </span>
 
-                            {/* NOWY TOOLTIP - OPCJA 1 CLEAN & DARK */}
-                            <div className="absolute left-0 top-full mt-3 hidden group-hover:block z-[9999] w- bg-[#1e293b] border border-slate-600/60 rounded- shadow-[0_20px_60px_rgba(0,0,0,0.6)] overflow-hidden animate-in fade-in slide-in-from-top-1 duration-200">
-                              {/* Header */}
-                              <div className="flex items-center gap-3 p- bg-white/[0.02] border-b border-slate-700/60">
+                            {/* TOOLTIP OPCJA 1 - CLEAN & DARK - POPRAWIONY */}
+                            <div className="absolute left-0 top-full mt-3 hidden group-hover:block z-[9999] w- bg-[#1e293b] border border-slate-600/60 rounded- shadow-[0_20px_60px_rgba(0,0,0,0.6)] overflow-hidden">
+                              <div className="flex items-center gap-3 p-4 bg-slate-900/50 border-b border-slate-700/60">
                                 <div className="w-9 h-9 rounded- bg-slate-900 border border-slate-600/50 grid place-items-center text-">{getCountryFlag(attempt.country)}</div>
                                 <div className="flex-1 min-w-0">
                                   <div className="font-mono font-bold text- text-white truncate">{attempt.ipAddress}</div>
@@ -106,51 +103,50 @@ export default function AdminDashboard() {
                                 <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.6)]"></div>
                               </div>
 
-                              {/* Body - rows */}
-                              <div className="p-2">
-                                <div className="px-3 py-2">
-                                  <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-3">
+                              <div className="px-2 py-2">
+                                <div className="px-3">
+                                  <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-4">
                                     <span className="text- text-slate-400 shrink-0">{"\u{1F30D}"} Kraj</span>
                                     <span className="text-[12.5px] font-medium text-slate-100 text-right break-words max-w-">{attempt.country}</span>
                                   </div>
                                   {attempt.city && (
-                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-3">
+                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-4">
                                       <span className="text- text-slate-400 shrink-0">{"\u{1F3D9}\uFE0F"} Miasto</span>
                                       <span className="text-[12.5px] font-medium text-slate-100 text-right break-words max-w-">{attempt.city}</span>
                                     </div>
                                   )}
                                   {attempt.zip && (
-                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-3">
+                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-4">
                                       <span className="text- text-slate-400 shrink-0">{"\u{1F4EE}"} Kod</span>
                                       <span className="text-[12.5px] font-medium text-slate-100 text-right">{attempt.zip}</span>
                                     </div>
                                   )}
                                   {attempt.timezone && (
-                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-3">
+                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-4">
                                       <span className="text- text-slate-400 shrink-0">{"\u{1F550}"} Strefa</span>
                                       <span className="text- font-mono text-slate-200 text-right break-words max-w-">{attempt.timezone}</span>
                                     </div>
                                   )}
                                   {attempt.isp && (
-                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-3">
+                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-4">
                                       <span className="text- text-slate-400 shrink-0">{"\u{1F4E1}"} ISP</span>
                                       <span className="text-[11.5px] font-medium text-slate-100 text-right break-words max-w- leading-[1.35]">{attempt.isp}</span>
                                     </div>
                                   )}
                                   {attempt.org && attempt.org!== attempt.isp && (
-                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-3">
+                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-4">
                                       <span className="text- text-slate-400 shrink-0">{"\u{1F3E2}"} Org</span>
                                       <span className="text-[11.5px] font-medium text-slate-100 text-right break-words max-w- leading-[1.35]">{attempt.org}</span>
                                     </div>
                                   )}
                                   {attempt.as && (
-                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-3">
+                                    <div className="flex justify-between items-start py- border-b border-white/[0.06] gap-4">
                                       <span className="text- text-slate-400 shrink-0">{"\u{1F522}"} AS</span>
                                       <span className="text- font-mono text-slate-300 text-right break-words max-w-">{attempt.as}</span>
                                     </div>
                                   )}
                                   {attempt.latitude && (
-                                    <div className="flex justify-between items-start py- gap-3">
+                                    <div className="flex justify-between items-start py- gap-4">
                                       <span className="text- text-slate-400 shrink-0">{"\u{1F4CD}"} Coords</span>
                                       <span className="text- font-mono text-slate-300 text-right">{attempt.latitude}, {attempt.longitude}</span>
                                     </div>
@@ -160,19 +156,17 @@ export default function AdminDashboard() {
 
                               <div className="h-px bg-slate-700/60 mx-3"></div>
 
-                              {/* Device */}
-                              <div className="p-3 pt-2">
-                                <div className="flex gap-2 text-">
-                                  {attempt.browserFamily && <span className="bg-slate-800 border border-slate-700 text-slate-300 px-2 py-1 rounded-full">{"\u{1F310}"} {attempt.browserFamily}</span>}
-                                  {attempt.osFamily && <span className="bg-slate-800 border border-slate-700 text-slate-400 px-2 py-1 rounded-full">{"\u{1F4BB}"} {attempt.osFamily}</span>}
-                                  {attempt.deviceType && <span className="bg-slate-800 border border-slate-700 text-slate-400 px-2 py-1 rounded-full">{"\u{1F4F1}"} {attempt.deviceType}</span>}
+                              <div className="p-3 pt-2.5">
+                                <div className="flex flex-wrap gap-2 text-">
+                                  {attempt.browserFamily && <span className="bg-slate-800 border border-slate-700 text-slate-300 px-2.5 py-1 rounded-full">{"\u{1F310}"} {attempt.browserFamily}</span>}
+                                  {attempt.osFamily && <span className="bg-slate-800 border border-slate-700 text-slate-400 px-2.5 py-1 rounded-full">{"\u{1F4BB}"} {attempt.osFamily}</span>}
+                                  {attempt.deviceType && <span className="bg-slate-800 border border-slate-700 text-slate-400 px-2.5 py-1 rounded-full">{"\u{1F4F1}"} {attempt.deviceType}</span>}
                                 </div>
                               </div>
 
-                              {/* Button */}
                               {attempt.latitude && (
                                 <div className="p-3 pt-0">
-                                  <a href={mapUrl} target="_blank" className="flex w-full h- items-center justify-center gap-2 bg-sky-500 hover:bg-sky-600 text-white rounded- text- font-bold transition-colors">
+                                  <a href={mapUrl} target="_blank" rel="noreferrer" className="flex w-full h-10 items-center justify-center gap-2 bg-sky-500 hover:bg-sky-600 text-white rounded- text- font-bold transition-colors">
                                     {"\u{1F5FA}\uFE0F"} Zobacz na mapie
                                   </a>
                                 </div>
