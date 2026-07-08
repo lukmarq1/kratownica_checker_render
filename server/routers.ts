@@ -5,9 +5,11 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
 import { parseUserAgent } from "./userAgentParser";
+import crypto from "crypto";
 
 const MAX_ATTEMPTS = 2;
 const LOCKOUT_MS = 24 * 60 * 60 * 1000;
+const VPN_DETECTION_WINDOW_MS = 60 * 60 * 1000;
 
 interface AttemptRecord {
   failedAttempts: number;
@@ -16,11 +18,16 @@ interface AttemptRecord {
   lastSeen: Date;
   totalAttempts: number;
   successfulAttempts: number;
+  ips: Set<string>;
+  fingerprints: Set<string>;
+  isRepeatedOffender: boolean;
 }
 
 interface HistoryEntry {
   id: string;
   ipAddress: string;
+  fingerprint: string;
+  deviceId: string;
   angle: number;
   isCorrect: number;
   country: string;
@@ -38,142 +45,83 @@ interface HistoryEntry {
   createdAt: Date;
   timestamp: Date;
   userAgent: string;
+  isVpn: boolean;
 }
 
 const attemptStore = new Map<string, AttemptRecord>();
 const historyStore: HistoryEntry[] = [];
 const geoCache = new Map<string, any>();
 
-function getOrCreateRecord(ip: string) {
-  let rec = attemptStore.get(ip);
+function getOrCreateRecord(key: string) {
+  let rec = attemptStore.get(key);
   if (!rec) {
-    rec = { failedAttempts: 0, lockedUntil: null, firstSeen: new Date(), lastSeen: new Date(), totalAttempts: 0, successfulAttempts: 0 };
-    attemptStore.set(ip, rec);
+    rec = { failedAttempts: 0, lockedUntil: null, firstSeen: new Date(), lastSeen: new Date(), totalAttempts: 0, successfulAttempts: 0, ips: new Set(), fingerprints: new Set(), isRepeatedOffender: false };
+    attemptStore.set(key, rec);
   }
-  if (rec.lockedUntil && rec.lockedUntil.getTime() < Date.now()) {
-    rec.failedAttempts = 0;
-    rec.lockedUntil = null;
-  }
+  if (rec.lockedUntil && rec.lockedUntil.getTime() < Date.now()) { rec.failedAttempts = 0; rec.lockedUntil = null; }
   rec.lastSeen = new Date();
   return rec;
 }
-
-async function isIpLocked(ip: string) {
-  const rec = attemptStore.get(ip);
+async function isLocked(key: string) {
+  const rec = attemptStore.get(key);
   if (!rec?.lockedUntil) return false;
-  if (rec.lockedUntil.getTime() < Date.now()) {
-    rec.failedAttempts = 0;
-    rec.lockedUntil = null;
-    return false;
-  }
+  if (rec.lockedUntil.getTime() < Date.now()) { rec.failedAttempts = 0; rec.lockedUntil = null; return false; }
   return true;
 }
-
-async function getRemainingLockoutTime(ip: string) {
-  const rec = attemptStore.get(ip);
+async function getRemainingLockoutTime(key: string) {
+  const rec = attemptStore.get(key);
   if (!rec?.lockedUntil) return 0;
   return Math.max(0, rec.lockedUntil.getTime() - Date.now());
 }
-
-async function recordFailedAttempt(ip: string) {
-  const rec = getOrCreateRecord(ip);
-  rec.failedAttempts += 1;
-  rec.totalAttempts += 1;
-  let isLocked = false;
-  let lockedUntil: Date | null = null;
-  if (rec.failedAttempts >= MAX_ATTEMPTS) {
-    isLocked = true;
-    lockedUntil = new Date(Date.now() + LOCKOUT_MS);
-    rec.lockedUntil = lockedUntil;
+async function recordFailedAttempt(key: string, ip: string, fingerprint?: string) {
+  const rec = getOrCreateRecord(key);
+  rec.failedAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
+  if (fingerprint) rec.fingerprints.add(fingerprint);
+  if (rec.ips.size > 1) rec.isRepeatedOffender = true;
+  let isLockedNow = false; let lockedUntil: Date | null = null;
+  if (rec.failedAttempts >= MAX_ATTEMPTS) { isLockedNow = true; lockedUntil = new Date(Date.now() + LOCKOUT_MS); rec.lockedUntil = lockedUntil; }
+  return { remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failedAttempts), isLocked: isLockedNow, lockedUntil };
+}
+async function resetAttempts(keys: string[], ip: string, fingerprint?: string) {
+  for (const key of keys) {
+    const rec = getOrCreateRecord(key);
+    rec.failedAttempts = 0; rec.lockedUntil = null; rec.successfulAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
+    if (fingerprint) rec.fingerprints.add(fingerprint);
   }
-  return { remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failedAttempts), isLocked, lockedUntil };
 }
-
-async function resetAttempts(ip: string) {
-  const rec = getOrCreateRecord(ip);
-  rec.failedAttempts = 0;
-  rec.lockedUntil = null;
-  rec.successfulAttempts += 1;
-  rec.totalAttempts += 1;
-}
-
 async function fetchGeo(ip: string) {
   if (ip.startsWith("fallback") || ip === "unknown" || ip.startsWith("192.168") || ip.startsWith("127.") || ip.startsWith("10.")) return null;
   if (geoCache.has(ip)) return geoCache.get(ip);
-  if (ip === "185.166.170.118") {
-    const hardcoded = {
-      country: "Poland", city: "Ostrołęka", zip: "07-410", timezone: "Europe/Warsaw",
-      isp: "Ynet Management Pawel Skrodzki", org: "YNET MANAGEMENT PAWEL SKRODZKI",
-      as: "AS57896 YNET MANAGEMENT PAWEL SKRODZKI", latitude: "53.0842", longitude: "21.5634"
-    };
-    geoCache.set(ip, hardcoded);
-    return hardcoded;
-  }
   try {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 2000);
-    const res = await fetch(`https://ipwho.is/${ip}`, { signal: controller.signal } as any);
-    clearTimeout(t);
-    if (!res.ok) return null;
-    const d = await res.json();
-    if (!d.success) return null;
-    const g = {
-      country: d.country || "Unknown",
-      city: d.city || "Unknown",
-      zip: d.postal || "",
-      timezone: d.timezone?.id || "",
-      isp: d.connection?.isp || "",
-      org: d.connection?.org || "",
-      as: d.connection?.asn? `AS${d.connection.asn} ${d.connection?.org || ""}` : "",
-      latitude: String(d.latitude || ""),
-      longitude: String(d.longitude || ""),
-    };
-    geoCache.set(ip, g);
-    return g;
+    const controller = new AbortController(); const t = setTimeout(() => controller.abort(), 2000);
+    const res = await fetch(`https://ipwho.is/${ip}`, { signal: controller.signal } as any); clearTimeout(t);
+    if (!res.ok) return null; const d = await res.json(); if (!d.success) return null;
+    const g = { country: d.country || "Unknown", city: d.city || "Unknown", zip: d.postal || "", timezone: d.timezone?.id || "", isp: d.connection?.isp || "", org: d.connection?.org || "", as: d.connection?.asn? `AS${d.connection.asn} ${d.connection?.org || ""}` : "", latitude: String(d.latitude || ""), longitude: String(d.longitude || ""), isHosting: d.connection?.hosting || false, isProxy: d.security?.is_proxy || d.security?.is_vpn || false };
+    geoCache.set(ip, g); return g;
   } catch { return null; }
 }
-
-async function addHistory(ip: string, angle: number, correct: boolean, ua: string, parsedUA: any, geo: any) {
-  const now = new Date();
-  const entry: HistoryEntry = {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    ipAddress: ip,
-    angle,
-    isCorrect: correct? 1 : 0,
-    country: geo?.country || "Unknown",
-    city: geo?.city || "Unknown",
-    zip: geo?.zip || "",
-    timezone: geo?.timezone || "",
-    isp: geo?.isp || "",
-    org: geo?.org || "",
-    as: geo?.as || "",
-    latitude: geo?.latitude || "",
-    longitude: geo?.longitude || "",
-    browserFamily: parsedUA?.browserFamily || parsedUA?.browser || "Unknown",
-    osFamily: parsedUA?.osFamily || parsedUA?.os || "Unknown",
-    deviceType: parsedUA?.deviceType || parsedUA?.device || "desktop",
-    createdAt: now,
-    timestamp: now,
-    userAgent: ua,
-  };
-  historyStore.unshift(entry);
-  if (historyStore.length > 1000) historyStore.pop();
+function detectVpnUsage(fingerprint: string, currentIp: string, currentGeo: any): boolean {
+  if (!fingerprint) return false;
+  const recent = historyStore.filter(h => h.fingerprint === fingerprint && Date.now() - h.createdAt.getTime() < VPN_DETECTION_WINDOW_MS);
+  if (recent.length === 0) return false;
+  const differentIp = recent.some(h => h.ipAddress!== currentIp);
+  const differentCountry = currentGeo && recent.some(h => h.country!== currentGeo.country);
+  return differentIp || differentCountry || currentGeo?.isHosting || currentGeo?.isProxy;
 }
-
+async function addHistory(ip: string, fingerprint: string, deviceId: string, angle: number, correct: boolean, ua: string, parsedUA: any, geo: any, isVpn: boolean) {
+  const now = new Date();
+  const entry: HistoryEntry = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, ipAddress: ip, fingerprint: fingerprint || "unknown", deviceId: deviceId || "unknown", angle, isCorrect: correct? 1 : 0, country: geo?.country || "Unknown", city: geo?.city || "Unknown", zip: geo?.zip || "", timezone: geo?.timezone || "", isp: geo?.isp || "", org: geo?.org || "", as: geo?.as || "", latitude: geo?.latitude || "", longitude: geo?.longitude || "", browserFamily: parsedUA?.browserFamily || parsedUA?.browser || "Unknown", osFamily: parsedUA?.osFamily || parsedUA?.os || "Unknown", deviceType: parsedUA?.deviceType || parsedUA?.device || "desktop", createdAt: now, timestamp: now, userAgent: ua, isVpn };
+  historyStore.unshift(entry); if (historyStore.length > 1000) historyStore.pop();
+}
 function getClientIp(req: any): string {
-  const xff = req.headers["x-forwarded-for"];
-  let ip = "unknown";
-  if (xff) {
-    const ips = Array.isArray(xff)? xff : xff.split(",");
-    const first = (ips[0] || "").trim();
-    if (first && first!== "unknown") ip = first;
-  }
+  const xff = req.headers["x-forwarded-for"]; let ip = "unknown";
+  if (xff) { const ips = Array.isArray(xff)? xff : xff.split(","); const first = (ips[0] || "").trim(); if (first && first!== "unknown") ip = first; }
   if (ip === "unknown" && req.ip && req.ip!== "unknown") ip = req.ip;
-  if (ip === "unknown") {
-    const ua = req.headers["user-agent"] || "";
-    ip = `fallback-${Buffer.from(ua).toString("base64").slice(0, 8)}`;
-  }
+  if (ip === "unknown") { const ua = req.headers["user-agent"] || ""; ip = `fallback-${Buffer.from(ua).toString("base64").slice(0, 8)}`; }
   return ip;
+}
+function getDeviceId(req: any): string {
+  const cookies = req.headers.cookie || ""; const match = cookies.match(/device_id=([^;]+)/); return match? match[1] : "";
 }
 
 export const appRouter = router({
@@ -181,121 +129,66 @@ export const appRouter = router({
   auth: router({
     me: publicProcedure.query(() => null),
     logout: publicProcedure.mutation(({ ctx }) => {
-      const cookieOptions = getSessionCookieOptions(ctx.req);
-      ctx.res.clearCookie(COOKIE_NAME, {...cookieOptions, maxAge: -1 });
-      return { success: true } as const;
+      const cookieOptions = getSessionCookieOptions(ctx.req); ctx.res.clearCookie(COOKIE_NAME, {...cookieOptions, maxAge: -1 }); return { success: true } as const;
     }),
   }),
   angle: router({
-    status: publicProcedure.query(async ({ ctx }) => {
-      const ip = getClientIp(ctx.req);
-      const locked = await isIpLocked(ip);
-      const remainingMs = locked? await getRemainingLockoutTime(ip) : 0;
-      const rec = getOrCreateRecord(ip);
-      return {
-        isLocked: locked,
-        failedAttempts: rec.failedAttempts,
-        remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failedAttempts),
-        remainingLockoutMs: remainingMs,
-      };
+    status: publicProcedure.input(z.object({ fingerprint: z.string().optional() }).optional()).query(async ({ ctx, input }) => {
+      const ip = getClientIp(ctx.req); const deviceId = getDeviceId(ctx.req); const primaryKey = input?.fingerprint || deviceId || ip;
+      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, input?.fingerprint].filter(Boolean))) as string[];
+      let locked = false; let remainingMs = 0;
+      for (const k of keysToCheck) { if (await isLocked(k)) { locked = true; remainingMs = await getRemainingLockoutTime(k); break; } }
+      const rec = getOrCreateRecord(primaryKey);
+      return { isLocked: locked, failedAttempts: rec.failedAttempts, remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failedAttempts), remainingLockoutMs: remainingMs, isRepeatedOffender: rec.isRepeatedOffender, ips: Array.from(rec.ips) };
     }),
-    verify: publicProcedure.input(z.object({ angle: z.number().min(0).max(360), browser: z.string().optional() })).mutation(async ({ input, ctx }) => {
+    verify: publicProcedure.input(z.object({ angle: z.number().min(0).max(360), browser: z.string().optional(), fingerprint: z.string().optional() })).mutation(async ({ input, ctx }) => {
       (ctx as any).user = { id: 1, openId: "public-user", name: "Gość", email: "guest@example.com", loginMethod: "public", role: "user", createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date() } as any;
-      const ip = getClientIp(ctx.req);
-      if (await isIpLocked(ip)) {
-        return { success: false, reason: "locked", remainingLockoutMs: await getRemainingLockoutTime(ip) };
-      }
-      const correctAngle = 65;
-      const tolerance = 0.5;
-      const isCorrect = input.angle >= correctAngle - tolerance && input.angle <= correctAngle + tolerance;
-      const ua = ctx.req.headers["user-agent"] || "unknown";
-      const parsedUA = parseUserAgent(ua);
-      if (input.browser) parsedUA.browserFamily = input.browser;
-      const geo = await fetchGeo(ip);
-      await addHistory(ip, input.angle, isCorrect, ua, parsedUA, geo);
-      if (isCorrect) {
-        await resetAttempts(ip);
-        return { success: true, reason: "correct", angle: input.angle };
-      } else {
-        const r = await recordFailedAttempt(ip);
-        return { success: false, reason: "incorrect", remainingAttempts: r.remainingAttempts, isLocked: r.isLocked, lockedUntil: r.lockedUntil, remainingLockoutMs: r.isLocked? (r.lockedUntil?.getTime() || 0) - Date.now() : 0 };
+      const ip = getClientIp(ctx.req); let deviceId = getDeviceId(ctx.req);
+      if (!deviceId) { deviceId = crypto.randomUUID(); if ((ctx.res as any).cookie) (ctx.res as any).cookie('device_id', deviceId, { maxAge: 365*24*60*60*1000, httpOnly: true, sameSite: 'lax', path: '/' }); }
+      const fingerprint = input.fingerprint || ""; const primaryKey = fingerprint || deviceId || ip;
+      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
+
+      for (const k of keysToCheck) { if (await isLocked(k)) { return { success: false, reason: "locked", remainingLockoutMs: await getRemainingLockoutTime(k) }; } }
+
+      const correctAngle = 65; const tolerance = 0.5; const isCorrect = input.angle >= correctAngle - tolerance && input.angle <= correctAngle + tolerance;
+      const ua = ctx.req.headers["user-agent"] || "unknown"; const parsedUA = parseUserAgent(ua); if (input.browser) parsedUA.browserFamily = input.browser as any;
+      const geo = await fetchGeo(ip); const isVpn = detectVpnUsage(fingerprint, ip, geo);
+      await addHistory(ip, fingerprint, deviceId, input.angle, isCorrect, ua, parsedUA, geo, isVpn);
+
+      if (isCorrect) { await resetAttempts(keysToCheck, ip, fingerprint); return { success: true, reason: "correct", angle: input.angle }; }
+      else {
+        let lastResult: any = null;
+        for (const k of keysToCheck) { lastResult = await recordFailedAttempt(k, ip, fingerprint); }
+        return { success: false, reason: isVpn? "vpn_detected" : "incorrect", remainingAttempts: lastResult.remainingAttempts, isLocked: lastResult.isLocked, lockedUntil: lastResult.lockedUntil, remainingLockoutMs: lastResult.isLocked? (lastResult.lockedUntil?.getTime() || 0) - Date.now() : 0, isVpn };
       }
     }),
   }),
   admin: router({
-    getAttempts: publicProcedure.input(z.object({ limit: z.number().default(100), offset: z.number().default(0) })).query(async ({ input }) => {
-      return historyStore.slice(input.offset, input.offset + input.limit);
-    }),
+    getAttempts: publicProcedure.input(z.object({ limit: z.number().default(100), offset: z.number().default(0) })).query(async ({ input }) => { return historyStore.slice(input.offset, input.offset + input.limit); }),
     getStats: publicProcedure.query(async () => {
-      const total = historyStore.length;
-      const ok = historyStore.filter(h => h.isCorrect === 1).length;
-      const fail = total - ok;
-      const uniq = attemptStore.size;
-      const locked = Array.from(attemptStore.values()).filter(r => r.lockedUntil && r.lockedUntil.getTime() > Date.now()).length;
-      return {
-        totalAttempts: total,
-        uniqueIps: uniq, uniqueIPs: uniq,
-        successfulAttempts: ok, failedAttempts: fail,
-        currentlyLockedIps: locked, lockedIPs: locked,
-        successRate: total? Math.round((ok / total) * 100) : 0,
-        repeatedOffenders: 0,
-      };
+      const total = historyStore.length; const ok = historyStore.filter(h => h.isCorrect === 1).length; const fail = total - ok; const uniq = attemptStore.size; const locked = Array.from(attemptStore.values()).filter(r => r.lockedUntil && r.lockedUntil.getTime() > Date.now()).length; const vpn = historyStore.filter(h => h.isVpn).length;
+      return { totalAttempts: total, uniqueIps: uniq, uniqueIPs: uniq, successfulAttempts: ok, failedAttempts: fail, currentlyLockedIps: locked, lockedIPs: locked, successRate: total? Math.round((ok / total) * 100) : 0, repeatedOffenders: Array.from(attemptStore.values()).filter(r => r.isRepeatedOffender).length, vpnAttempts: vpn };
     }),
     getAdvancedAnalytics: publicProcedure.query(async () => {
-      const total = historyStore.length;
-      const ok = historyStore.filter(h => h.isCorrect === 1).length;
-      const fail = total - ok;
-      const uniq = attemptStore.size;
-      const byCountry: Record<string, number> = {};
-      historyStore.forEach(h => { byCountry[h.country] = (byCountry[h.country] || 0) + 1; });
-      const geoDist = Object.entries(byCountry).map(([country, count]) => ({ country, count }));
-      const byDevice: Record<string, number> = {};
-      historyStore.forEach(h => { byDevice[h.deviceType] = (byDevice[h.deviceType] || 0) + 1; });
-      const devDist = Object.entries(byDevice).map(([deviceType, count]) => ({ deviceType, count }));
-      const failedMap: Record<string, { total: number; fail: number; country: string }> = {};
-      historyStore.forEach(h => {
-        if (!failedMap[h.ipAddress]) failedMap[h.ipAddress] = { total: 0, fail: 0, country: h.country };
-        failedMap[h.ipAddress].total++; if (h.isCorrect === 0) failedMap[h.ipAddress].fail++;
-      });
-      const repeat = Object.entries(failedMap).filter(([_, v]) => v.fail >= 2).map(([ipAddress, v], idx) => ({ id: String(idx), ipAddress, country: v.country, totalAttempts: v.total, failedAttempts: v.fail }));
-      return {
-        totalAttempts: total, uniqueIps: uniq, uniqueIPs: uniq,
-        successfulAttempts: ok, failedAttempts: fail,
-        successRate: total? String(Math.round((ok / total) * 100)) : "0",
-        repeatOffenders: repeat, geographicDistribution: geoDist, deviceDistribution: devDist,
-      };
+      const total = historyStore.length; const ok = historyStore.filter(h => h.isCorrect === 1).length; const fail = total - ok; const uniq = attemptStore.size;
+      const byCountry: Record<string, number> = {}; historyStore.forEach(h => { byCountry[h.country] = (byCountry[h.country] || 0) + 1; }); const geoDist = Object.entries(byCountry).map(([country, count]) => ({ country, count }));
+      const byDevice: Record<string, number> = {}; historyStore.forEach(h => { byDevice[h.deviceType] = (byDevice[h.deviceType] || 0) + 1; }); const devDist = Object.entries(byDevice).map(([deviceType, count]) => ({ deviceType, count }));
+      const failedMap: Record<string, { total: number; fail: number; country: string; ips: string[]; isVpn: boolean }> = {};
+      historyStore.forEach(h => { const k = h.fingerprint || h.deviceId || h.ipAddress; if (!failedMap[k]) failedMap[k] = { total: 0, fail: 0, country: h.country, ips: [], isVpn: false }; failedMap[k].total++; if (h.isCorrect === 0) failedMap[k].fail++; if (!failedMap[k].ips.includes(h.ipAddress)) failedMap[k].ips.push(h.ipAddress); if (h.isVpn) failedMap[k].isVpn = true; });
+      const repeat = Object.entries(failedMap).filter(([_, v]) => v.fail >= 2 || v.ips.length > 1).map(([id, v], idx) => ({ id: String(idx), ipAddress: v.ips.join(', '), fingerprint: id, country: v.country, totalAttempts: v.total, failedAttempts: v.fail, isVpn: v.isVpn, ips: v.ips }));
+      return { totalAttempts: total, uniqueIps: uniq, uniqueIPs: uniq, successfulAttempts: ok, failedAttempts: fail, successRate: total? String(Math.round((ok / total) * 100)) : "0", repeatOffenders: repeat, geographicDistribution: geoDist, deviceDistribution: devDist, vpnAttempts: historyStore.filter(h => h.isVpn).length };
     }),
-    getUserProfile: publicProcedure.input(z.object({ ipAddress: z.string() })).query(async ({ input }) => {
-      const history = historyStore.filter(h => h.ipAddress === input.ipAddress);
-      if (!history.length) return null;
-      const first = history[0];
-      return {
-        country: first.country, city: first.city, isp: first.isp,
-        deviceType: first.deviceType, org: first.org, zip: first.zip, timezone: first.timezone, as: first.as,
-        attempts: history.map(h => ({ id: h.id, angle: h.angle, isCorrect: h.isCorrect, createdAt: h.createdAt })),
-      };
+    getUserProfile: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ input }) => {
+      const key = input.fingerprint || input.deviceId || input.ipAddress; if (!key) return null; const history = historyStore.filter(h => h.fingerprint === key || h.deviceId === key || h.ipAddress === key); if (!history.length) return null; const first = history[0];
+      return { country: first.country, city: first.city, isp: first.isp, deviceType: first.deviceType, org: first.org, zip: first.zip, timezone: first.timezone, as: first.as, fingerprint: first.fingerprint, deviceId: first.deviceId, ips: Array.from(new Set(history.map(h => h.ipAddress))), isVpn: history.some(h => h.isVpn), attempts: history.map(h => ({ id: h.id, angle: h.angle, isCorrect: h.isCorrect, createdAt: h.createdAt, ip: h.ipAddress, isVpn: h.isVpn })) };
     }),
     exportData: publicProcedure.query(async () => {
-      const headers = ["ID","IP","Kat","Poprawny","Data","Przegladarka","OS","Miasto","Kraj"];
-      const rows = historyStore.map(h => [h.id, h.ipAddress, String(h.angle), h.isCorrect? "TAK":"NIE", h.createdAt.toISOString(), h.browserFamily, h.osFamily, h.city, h.country]);
+      const headers = ["ID","IP","Fingerprint","DeviceID","Kat","Poprawny","Data","Przegladarka","OS","Miasto","Kraj","VPN"]; const rows = historyStore.map(h => [h.id, h.ipAddress, h.fingerprint, h.deviceId, String(h.angle), h.isCorrect? "TAK":"NIE", h.createdAt.toISOString(), h.browserFamily, h.osFamily, h.city, h.country, h.isVpn? "TAK" : "NIE"]);
       return [headers.join(","),...rows.map(r => r.map(v=>`"${v}"`).join(","))].join("\n");
     }),
-    unlockIp: publicProcedure.input(z.object({ ipAddress: z.string() })).mutation(async ({ input }) => {
-      attemptStore.delete(input.ipAddress);
-      return { success: true, ipAddress: input.ipAddress };
-    }),
-    verifyPin: publicProcedure.input(z.object({ pin: z.string() })).mutation(async ({ input }) => {
-      const adminPin = ENV.adminPin;
-      if (!adminPin) return { success: false, error: "Admin PIN not configured" };
-      return { success: input.pin === adminPin };
-    }),
-    getLockedIPs: publicProcedure.query(async () => {
-      const locked: string[] = [];
-      for (const [ip, rec] of attemptStore.entries()) {
-        if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) locked.push(ip);
-      }
-      return locked;
-    }),
+    unlockIp: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional() })).mutation(async ({ input }) => { const keys = [input.fingerprint, input.deviceId, input.ipAddress].filter(Boolean) as string[]; for (const k of keys) attemptStore.delete(k); return { success: true, keys }; }),
+    verifyPin: publicProcedure.input(z.object({ pin: z.string() })).mutation(async ({ input }) => { const adminPin = ENV.adminPin; if (!adminPin) return { success: false, error: "Admin PIN not configured" }; return { success: input.pin === adminPin }; }),
+    getLockedIPs: publicProcedure.query(async () => { const locked: string[] = []; for (const [key, rec] of attemptStore.entries()) { if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) locked.push(key); } return locked; }),
   }),
 });
 export type AppRouter = typeof appRouter;
