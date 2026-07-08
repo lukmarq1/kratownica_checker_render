@@ -6,7 +6,6 @@ import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
 import { parseUserAgent } from "./userAgentParser";
 
-// ============ IN-MEMORY DATABASE - ZASTĘPUJE AIVEN ============
 interface AttemptRecord {
   failedAttempts: number;
   lockedUntil: Date | null;
@@ -100,12 +99,12 @@ async function recordFailedAttempt(ip: string) {
   rec.lastSeen = new Date();
   let isLocked = false;
   let lockedUntil: Date | null = null;
-  if (rec.failedAttempts >= 3) {
+  if (rec.failedAttempts >= 2) {
     isLocked = true;
     lockedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000);
     rec.lockedUntil = lockedUntil;
   }
-  return { remainingAttempts: Math.max(0, 3 - rec.failedAttempts), isLocked, lockedUntil };
+  return { remainingAttempts: Math.max(0, 2 - rec.failedAttempts), isLocked, lockedUntil };
 }
 
 async function resetAttempts(ip: string) {
@@ -170,7 +169,6 @@ async function getAdminStats() {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const todayAttempts = historyStore.filter((h) => h.timestamp.getTime() >= today.getTime()).length;
-
   return {
     totalAttempts: total,
     successfulAttempts: successful,
@@ -185,33 +183,24 @@ async function getAdminStats() {
 
 async function getAdvancedAnalytics() {
   const stats = await getAdminStats();
-
-  // Attempts by hour
   const byHour: Record<number, number> = {};
   for (let i = 0; i < 24; i++) byHour[i] = 0;
   historyStore.forEach((h) => { byHour[h.timestamp.getHours()]++; });
-
-  // Attempts by browser
   const byBrowser: Record<string, number> = {};
   historyStore.forEach((h) => {
     const b = h.browserFamily || h.browser || "Unknown";
     byBrowser[b] = (byBrowser[b] || 0) + 1;
   });
-
-  // Attempts by OS
   const byOS: Record<string, number> = {};
   historyStore.forEach((h) => {
     const os = h.os || "Unknown";
     byOS[os] = (byOS[os] || 0) + 1;
   });
-
-  // Top failed IPs
   const failedByIp: Record<string, number> = {};
   historyStore.filter(h =>!h.isCorrect).forEach(h => {
     failedByIp[h.ipAddress] = (failedByIp[h.ipAddress] || 0) + 1;
   });
   const topFailedIPs = Object.entries(failedByIp).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([ip, count]) => ({ ip, count }));
-
   return {
    ...stats,
     attemptsByHour: byHour,
@@ -227,7 +216,6 @@ async function getUserProfileWithTracking(ipAddress: string) {
   const rec = attemptStore.get(ipAddress);
   const history = historyStore.filter((h) => h.ipAddress === ipAddress);
   if (!rec && history.length === 0) return null;
-
   return {
     ipAddress,
     totalAttempts: history.length,
@@ -240,11 +228,13 @@ async function getUserProfileWithTracking(ipAddress: string) {
     failedAttemptsCount: rec?.failedAttempts || 0,
     history: history.slice(0, 50),
     browsers: [...new Set(history.map(h => h.browser).filter(Boolean))],
+    os: [...new Set(history.map(h => h.os).filter(Boolean))],
+    attempts: history,
   };
 }
 
 async function exportAttemptDataAsCSV() {
-  const headers = ["ID", "IP", "Kąt", "Poprawny", "Data", "Przeglądarka", "OS", "Miasto", "Kraj"];
+  const headers = ["ID", "IP", "Kat", "Poprawny", "Data", "Przegladarka", "OS", "Miasto", "Kraj"];
   const rows = historyStore.map(h => [
     h.id,
     h.ipAddress,
@@ -280,23 +270,6 @@ function getClientIp(req: any): string {
   return ip;
 }
 
-async function fetchGeolocationSafe(ip: string) {
-  // Bez zewnętrznego API żeby nie blokować - zwraca null, ale nie wiesza serwera
-  // Jesli chcesz geo, mozna odkomentowac ponizej z timeoutem
-  return null;
-  /*
-  if (ip.startsWith("fallback") || ip === "unknown" || ip.startsWith("192.168") || ip.startsWith("127.")) return null;
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 1500);
-    const res = await fetch(`https://ipapi.co/${ip}/json/`, { signal: controller.signal } as any);
-    clearTimeout(timeout);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch { return null; }
-  */
-}
-
 export const appRouter = router({
   system: systemRouter,
   auth: router({
@@ -307,7 +280,6 @@ export const appRouter = router({
       return { success: true } as const;
     }),
   }),
-
   angle: router({
     status: publicProcedure.query(async ({ ctx }) => {
       const ipAddress = getClientIp(ctx.req);
@@ -317,49 +289,39 @@ export const appRouter = router({
       return {
         isLocked: locked,
         failedAttempts: record.failedAttempts || 0,
-        remainingAttempts: Math.max(0, 3 - (record.failedAttempts || 0)),
+        remainingAttempts: Math.max(0, 2 - (record.failedAttempts || 0)),
         remainingLockoutMs: remainingMs,
       };
     }),
-
     verify: publicProcedure
      .input(z.object({ angle: z.number().min(0).max(360), browser: z.string().optional() }))
      .mutation(async ({ input, ctx }) => {
-        ctx.user = {
+        (ctx as any).user = {
           id: 1, openId: "public-user", name: "Gość",
           email: "guest@example.com", loginMethod: "public", role: "user",
           createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date(),
-        } as any;
-
+        };
         const ipAddress = getClientIp(ctx.req);
-
         const isLockedNow = await isIpLocked(ipAddress);
         if (isLockedNow) {
           const remainingMs = await getRemainingLockoutTime(ipAddress);
           return { success: false, reason: "locked", remainingLockoutMs: remainingMs };
         }
-
         const correctAngle = 65;
         const tolerance = 0.5;
         const isCorrect = input.angle >= correctAngle - tolerance && input.angle <= correctAngle + tolerance;
-
-        let geoData = null;
-        try { geoData = await fetchGeolocationSafe(ipAddress); } catch {}
-
         const userAgent = ctx.req.headers["user-agent"] || "unknown";
         const parsedUA = parseUserAgent(userAgent);
         if (input.browser) parsedUA.browserFamily = input.browser;
-
         const record = getOrCreateRecord(ipAddress);
         const attemptNumber = (record.failedAttempts || 0) + 1;
-
         if (isCorrect) {
           await resetAttempts(ipAddress);
-          await recordAttemptHistory(ipAddress, input.angle, true, attemptNumber, userAgent, geoData || undefined, parsedUA);
+          await recordAttemptHistory(ipAddress, input.angle, true, attemptNumber, userAgent, undefined, parsedUA);
           return { success: true, reason: "correct", angle: input.angle };
         } else {
           const result = await recordFailedAttempt(ipAddress);
-          await recordAttemptHistory(ipAddress, input.angle, false, attemptNumber, userAgent, geoData || undefined, parsedUA);
+          await recordAttemptHistory(ipAddress, input.angle, false, attemptNumber, userAgent, undefined, parsedUA);
           return {
             success: false,
             reason: "incorrect",
@@ -371,7 +333,6 @@ export const appRouter = router({
         }
       }),
   }),
-
   admin: router({
     getAttempts: publicProcedure.input(z.object({ limit: z.number().default(100), offset: z.number().default(0) })).query(async ({ input }) => {
       return await getAllAttempts(input.limit, input.offset);
