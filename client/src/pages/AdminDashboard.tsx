@@ -2,7 +2,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { trpc } from "@/lib/trpc";
 import { useState } from "react";
-import { Lock, CheckCircle2, XCircle, ArrowLeft, LogOut, MapPin } from "lucide-react";
+import { Lock, CheckCircle2, XCircle, ArrowLeft, LogOut, MapPin, Globe, Monitor, Clock, Laptop, ShieldAlert, Smartphone } from "lucide-react";
 import AdminLogin from "./AdminLogin";
 
 function UnlockButton({ ipAddress }: { ipAddress: string }) {
@@ -16,11 +16,11 @@ function UnlockButton({ ipAddress }: { ipAddress: string }) {
   return (
     <Button
       onClick={() => {
-        if (confirm(`Odblokowa\u0107 ${ipAddress}?`)) m.mutateAsync({ ipAddress });
+        if (confirm(`Odblokować ${ipAddress}?`)) m.mutateAsync({ ipAddress });
       }}
       disabled={m.isPending}
       size="sm"
-      className="bg-orange-600 hover:bg-orange-700 text-white font-mono text-xs h-7 px-3"
+      className="bg-gradient-to-r from-orange-600 to-red-600 hover:from-orange-500 hover:to-red-500 text-white font-mono text-xs h-8 px-4 font-bold w-full mt-3"
     >
       {m.isPending ? "..." : "Odblokuj"}
     </Button>
@@ -34,7 +34,6 @@ function IpTooltip({ a }: { a: any }) {
 
   return (
     <div className="absolute left-0 top-full mt-3 hidden group-hover:block z-[9999] w-[380px] bg-[#1e293b] border border-[#334155] rounded-[16px] overflow-hidden shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
-      {/* HEAD - jak w HTML */}
       <div className="flex items-center gap-3 px-5 py-[18px] border-b border-[#334155] bg-white/[0.02]">
         <div className="w-9 h-9 rounded-[10px] bg-[#0f172a] border border-[#334155] grid place-items-center text-lg">
           {"\u{1F4CD}"}
@@ -45,8 +44,6 @@ function IpTooltip({ a }: { a: any }) {
         </div>
         <div className="w-2 h-2 rounded-full bg-[#22c55e] shadow-[0_0_8px_#22c55e]"></div>
       </div>
-
-      {/* BODY */}
       <div className="px-5 py-[14px]">
         <div className="flex justify-between py-[9px] border-b border-white/[0.06] gap-4">
           <span className="text-[#94a3b8] text-[12.5px]">{"\u{1F30D} Kraj"}</span>
@@ -81,9 +78,7 @@ function IpTooltip({ a }: { a: any }) {
           <span className="text-[#e2e8f0] font-medium text-[12.5px] text-right max-w-[200px] break-words">{a.latitude ? `${a.latitude}, ${a.longitude}` : "\u2014"}</span>
         </div>
       </div>
-
       <div className="h-px bg-[#334155] mx-5"></div>
-
       <div className="px-5 pt-[10px] pb-0">
         <div className="flex justify-between py-[5px] gap-4">
           <span className="text-[#94a3b8] text-[12.5px]">{"\u{1F310} Przegl\u0105darka"}</span>
@@ -98,17 +93,88 @@ function IpTooltip({ a }: { a: any }) {
           <span className="text-[#e2e8f0] font-medium text-[12.5px] text-right max-w-[200px] break-words">{a.deviceType || "desktop"}</span>
         </div>
       </div>
-
       <div className="p-5">
-        <a
-          href={mapUrl}
-          target="_blank"
-          rel="noreferrer"
-          className="flex w-[calc(100%)] h-[42px] items-center justify-center gap-2 rounded-[10px] bg-[#0ea5e9] hover:bg-[#0284c7] font-bold text-[13px] text-white no-underline transition-colors"
-        >
+        <a href={mapUrl} target="_blank" rel="noreferrer" className="flex w-full h-[42px] items-center justify-center gap-2 rounded-[10px] bg-[#0ea5e9] hover:bg-[#0284c7] font-bold text-[13px] text-white no-underline transition-colors">
           {"\u{1F5FA}\uFE0F Zobacz na mapie"}
         </a>
       </div>
+    </div>
+  );
+}
+
+function BlockedCard({ id, attempts }: { id: string, attempts: any[] }) {
+  const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(id);
+  // znajdź ostatnią próbę dla tego ID
+  const details = attempts.find((a: any) => 
+    a.ipAddress === id || 
+    a.fingerprint === id || 
+    a.id === id
+  ) || attempts.find((a: any) => !isIp && a.ipAddress && attempts.length > 0) || null;
+
+  // dla fingerprint, jeśli nie ma fingerprint w historii, weź ostatnią próbę z tym samym IP żeby pokazać kraj
+  const fallback = !details && !isIp ? attempts[0] : null;
+  const info = details || fallback;
+
+  return (
+    <div className="bg-[#0f172a] border border-orange-500/30 rounded-xl p-4 hover:border-orange-500/60 transition-all hover:shadow-[0_0_20px_rgba(249,115,22,0.15)] flex flex-col">
+      {/* HEADER */}
+      <div className="flex justify-between items-start mb-3">
+        <span className={`flex items-center gap-1.5 text-[10px] font-mono px-2.5 py-1 rounded-full font-bold tracking-wide border ${isIp ? 'bg-blue-500/10 text-blue-300 border-blue-500/30' : 'bg-purple-500/10 text-purple-300 border-purple-500/30'}`}>
+          {isIp ? <><Globe className="w-3 h-3" /> IP / VPN</> : <><Monitor className="w-3 h-3" /> URZĄDZENIE</>}
+        </span>
+        {info?.country && (
+          <span className="text-[11px] text-slate-400 flex items-center gap-1 font-mono">
+            <MapPin className="w-3 h-3" /> {info.country} {info.city ? `• ${info.city}` : ''}
+          </span>
+        )}
+      </div>
+
+      {/* ID */}
+      <div className="font-mono text-[13px] text-orange-300 break-all bg-black/40 p-2.5 rounded-lg border border-white/5 leading-relaxed">
+        {isIp ? id : `${id.slice(0, 20)}...`}
+        {!isIp && <div className="text-[10px] text-slate-500 mt-1">ID: {id.slice(0,8)}... chronione przed VPN</div>}
+      </div>
+
+      {/* DETAILS */}
+      <div className="mt-3 space-y-2 text-xs font-mono flex-1">
+        {info ? (
+          <>
+            <div className="flex justify-between items-center text-slate-400 bg-white/[0.02] px-2.5 py-1.5 rounded-md">
+              <span className="flex items-center gap-1.5"><Laptop className="w-3.5 h-3" /> Przeglądarka</span>
+              <span className="text-slate-200 truncate max-w-[130px] text-right">{info.browserFamily || info.browser || 'Chrome'} / {info.osFamily || 'Windows'}</span>
+            </div>
+            <div className="flex justify-between items-center text-slate-400 bg-white/[0.02] px-2.5 py-1.5 rounded-md">
+              <span className="flex items-center gap-1.5"><Smartphone className="w-3.5 h-3" /> Urządzenie</span>
+              <span className="text-slate-200">{info.deviceType || 'desktop'}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="bg-white/[0.02] px-2.5 py-1.5 rounded-md">
+                <div className="text-[10px] text-slate-500">Ostatni kąt</div>
+                <div className="text-cyan-300 font-bold">{info.angle ?? '—'}°</div>
+              </div>
+              <div className="bg-white/[0.02] px-2.5 py-1.5 rounded-md">
+                <div className="text-[10px] text-slate-500">Status</div>
+                <div className="text-red-400 font-bold">2 x FAIL</div>
+              </div>
+            </div>
+            <div className="flex justify-between items-center text-slate-400 px-1 pt-1">
+              <span className="flex items-center gap-1 text-[11px]"><Clock className="w-3 h-3" /> Zablokowano</span>
+              <span className="text-slate-300 text-[11px]">{info.createdAt ? new Date(info.createdAt).toLocaleString("pl-PL") : 'teraz'}</span>
+            </div>
+            {isIp && info.isp && (
+              <div className="text-[11px] text-slate-500 truncate px-1">ISP: {info.isp}</div>
+            )}
+          </>
+        ) : (
+          <div className="text-slate-500 italic text-center py-4">
+            <ShieldAlert className="w-6 h-6 mx-auto mb-1 opacity-50" />
+            Brak szczegółów w historii<br/>
+            <span className="text-[11px]">ID urządzenia z fingerprintingu</span>
+          </div>
+        )}
+      </div>
+
+      <UnlockButton ipAddress={id} />
     </div>
   );
 }
@@ -124,10 +190,14 @@ export default function AdminDashboard() {
   const lockedIPs = lockedQ.data || [];
 
   const getFlag = (c: string) => {
-    if (c === "Poland") return "\u{1F1F5}\u{1F1F1}";
-    if (c === "United States") return "\u{1F1FA}\u{1F1F8}";
-    if (c === "Germany") return "\u{1F1E9}\u{1F1EA}";
-    return "\u{1F30D}";
+    if (!c) return "🌍";
+    if (c === "Poland") return "🇵🇱";
+    if (c === "United States") return "🇺🇸";
+    if (c === "Germany") return "🇩🇪";
+    if (c === "Norway") return "🇳🇴";
+    if (c === "Netherlands") return "🇳🇱";
+    if (c === "United Kingdom") return "🇬🇧";
+    return "🌍";
   };
 
   return (
@@ -136,38 +206,47 @@ export default function AdminDashboard() {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-4xl font-bold font-mono tracking-tighter text-slate-100">PANEL ADMINISTRATORA</h1>
-            <p className="text-slate-400 text-sm mt-1 font-mono">{"Historia pr\u00F3b"}</p>
+            <p className="text-slate-400 text-sm mt-1 font-mono">Historia prób i blokady</p>
           </div>
           <div className="flex gap-2">
-            <Button onClick={() => (window.location.href = "/")} variant="outline" className="border-slate-600 text-slate-300 gap-2"><ArrowLeft className="w-4 h-4" />{"Wr\u00F3\u0107"}</Button>
+            <Button onClick={() => (window.location.href = "/")} variant="outline" className="border-slate-600 text-slate-300 gap-2"><ArrowLeft className="w-4 h-4" />Wróć</Button>
             <Button onClick={() => { sessionStorage.removeItem("adminPin"); setPinVerified(false); }} variant="outline" className="border-slate-600 text-slate-300 gap-2"><LogOut className="w-4 h-4" />Wyloguj</Button>
           </div>
         </div>
 
         <Card className="bg-slate-800 border-slate-700 mb-6">
           <div className="p-6">
-            <div className="flex items-center gap-2 mb-4"><Lock className="w-5 h-5 text-orange-400" /><h2 className="text-lg font-bold text-white font-mono">Zablokowane IP</h2></div>
+            <div className="flex items-center gap-3 mb-5">
+              <div className="p-2 bg-orange-500/10 rounded-lg border border-orange-500/20">
+                <Lock className="w-5 h-5 text-orange-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-bold text-white font-mono flex items-center gap-2">
+                  Zablokowane urządzenia / IP
+                  <span className="text-xs bg-orange-500/20 text-orange-300 px-2.5 py-0.5 rounded-full border border-orange-500/20">{lockedIPs.length} blokad</span>
+                </h2>
+                <p className="text-xs text-slate-500 font-mono mt-0.5">💻 = fingerprint (odporne na VPN) • 🌐 = adres IP</p>
+              </div>
+            </div>
             {lockedIPs.length > 0 ? (
-              <div className="flex flex-wrap gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {lockedIPs.map((ip: string) => (
-                  <div key={ip} className="bg-slate-700/50 rounded-lg p-3 border border-orange-500/30 flex gap-3 items-center">
-                    <span className="text-orange-400 font-mono font-bold text-sm">{ip}</span><UnlockButton ipAddress={ip} />
-                  </div>
+                  <BlockedCard key={ip} id={ip} attempts={attempts} />
                 ))}
               </div>
-            ) : <p className="text-slate-400 font-mono text-sm">Brak zablokowanych IP</p>}
+            ) : <p className="text-slate-400 font-mono text-sm bg-slate-900/50 border border-dashed border-slate-700 rounded-xl p-8 text-center">Brak zablokowanych urządzeń 🎉<br/><span className="text-xs text-slate-500">Wszystkie urządzenia mają dostęp</span></p>}
           </div>
         </Card>
 
         <Card className="bg-slate-800 border-slate-700 overflow-visible">
           <div className="p-6 overflow-visible">
-            <div className="flex items-center gap-2 mb-6"><MapPin className="w-5 h-5 text-cyan-400" /><h2 className="text-lg font-bold text-white font-mono">{"Historia pr\u00F3b"}</h2></div>
+            <div className="flex items-center gap-2 mb-6"><MapPin className="w-5 h-5 text-cyan-400" /><h2 className="text-lg font-bold text-white font-mono">Historia prób</h2></div>
             <div className="overflow-visible">
               <table className="w-full text-sm font-mono">
                 <thead>
                   <tr className="border-b-2 border-slate-600">
                     <th className="text-left py-3 px-3 text-slate-400">IP</th>
-                    <th className="text-left py-3 px-3 text-slate-400">{"K\u0105t"}</th>
+                    <th className="text-left py-3 px-3 text-slate-400">Kąt</th>
                     <th className="text-left py-3 px-3 text-slate-400">Status</th>
                     <th className="text-left py-3 px-3 text-slate-400">Lokalizacja</th>
                     <th className="text-left py-3 px-3 text-slate-400">Czas</th>
@@ -201,7 +280,7 @@ export default function AdminDashboard() {
             <div className="flex justify-between items-center mt-8 pt-4 border-t border-slate-700">
               <Button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0} variant="outline" className="border-slate-600 text-slate-300">Poprzednia</Button>
               <span className="text-slate-400 font-mono text-sm">Strona {page + 1}</span>
-              <Button onClick={() => setPage(page + 1)} disabled={attempts.length < pageSize} variant="outline" className="border-slate-600 text-slate-300">{"Nast\u0119pna"}</Button>
+              <Button onClick={() => setPage(page + 1)} disabled={attempts.length < pageSize} variant="outline" className="border-slate-600 text-slate-300">Następna</Button>
             </div>
           </div>
         </Card>
