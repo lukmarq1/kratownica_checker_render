@@ -102,6 +102,63 @@ function IpTooltip({ a }: { a: any }) {
   );
 }
 
+const COUNTRY_MAP: Record<string, string> = {
+  "Poland": "PL", "Polska": "PL",
+  "United States": "US", "USA": "US", "United States of America": "US",
+  "Germany": "DE", "Niemcy": "DE",
+  "Norway": "NO", "Norwegia": "NO",
+  "Netherlands": "NL", "Holandia": "NL",
+  "United Kingdom": "GB", "Wielka Brytania": "GB", "UK": "GB", "England": "GB",
+  "France": "FR", "Francja": "FR",
+  "Sweden": "SE", "Szwecja": "SE",
+  "Denmark": "DK", "Dania": "DK",
+  "Finland": "FI", "Finlandia": "FI",
+  "Czech Republic": "CZ", "Czechia": "CZ", "Czechy": "CZ",
+  "Slovakia": "SK", "Słowacja": "SK",
+  "Ukraine": "UA", "Ukraina": "UA",
+  "Russia": "RU", "Rosja": "RU",
+  "Belarus": "BY", "Białoruś": "BY",
+  "Lithuania": "LT", "Litwa": "LT",
+  "Latvia": "LV", "Łotwa": "LV",
+  "Estonia": "EE", "Estonia": "EE",
+  "Italy": "IT", "Włochy": "IT",
+  "Spain": "ES", "Hiszpania": "ES",
+  "Portugal": "PT", "Portugalia": "PT",
+  "Ireland": "IE", "Irlandia": "IE",
+  "Belgium": "BE", "Belgia": "BE",
+  "Austria": "AT",
+  "Switzerland": "CH", "Szwajcaria": "CH",
+  "Canada": "CA", "Kanada": "CA",
+  "Australia": "AU",
+  "Brazil": "BR", "Brazylia": "BR",
+  "Japan": "JP", "Japonia": "JP",
+  "China": "CN", "Chiny": "CN",
+  "India": "IN", "Indie": "IN",
+  "Turkey": "TR", "Turcja": "TR",
+  "Greece": "GR", "Grecja": "GR",
+  "Hungary": "HU", "Węgry": "HU",
+  "Romania": "RO", "Rumunia": "RO",
+  "Bulgaria": "BG", "Bułgaria": "BG",
+  "Croatia": "HR", "Chorwacja": "HR",
+  "Serbia": "RS", "Serbia": "RS",
+  "Slovenia": "SI", "Słowenia": "SI",
+  "Iceland": "IS", "Islandia": "IS",
+};
+
+function isoToFlag(iso: string) {
+  if (!iso || iso.length !== 2) return "🌍";
+  return String.fromCodePoint(...[...iso.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65));
+}
+
+const getFlagStatic = (countryName: string, countryCode?: string) => {
+  if (countryCode && countryCode.length === 2) return isoToFlag(countryCode);
+  if (!countryName) return "🌍";
+  const code = COUNTRY_MAP[countryName];
+  if (code) return isoToFlag(code);
+  // fallback: spróbuj pierwsze 2 litery jako kod
+  return "🌍";
+};
+
 function BlockedCard({ id, attempts }: { id: string, attempts: any[] }) {
   const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(id);
   // znajdź ostatnią próbę dla tego ID
@@ -124,7 +181,7 @@ function BlockedCard({ id, attempts }: { id: string, attempts: any[] }) {
         </span>
         {info?.country && (
           <span className="text-[11px] text-slate-400 flex items-center gap-1 font-mono">
-            <MapPin className="w-3 h-3" /> {info.country} {info.city ? `• ${info.city}` : ''}
+            <span>{getFlagStatic(info.country, info.countryCode || info.country_code)}</span> {info.country} {info.city ? `• ${info.city}` : ''}
           </span>
         )}
       </div>
@@ -189,16 +246,7 @@ export default function AdminDashboard() {
   const attempts = attemptsQ.data || [];
   const lockedIPs = lockedQ.data || [];
 
-  const getFlag = (c: string) => {
-    if (!c) return "🌍";
-    if (c === "Poland") return "🇵🇱";
-    if (c === "United States") return "🇺🇸";
-    if (c === "Germany") return "🇩🇪";
-    if (c === "Norway") return "🇳🇴";
-    if (c === "Netherlands") return "🇳🇱";
-    if (c === "United Kingdom") return "🇬🇧";
-    return "🌍";
-  };
+  const getFlag = (c: string, code?: string) => getFlagStatic(c, code);
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-800 to-slate-900 p-4 pb-20">
@@ -248,6 +296,7 @@ export default function AdminDashboard() {
                     <th className="text-left py-3 px-3 text-slate-400">IP</th>
                     <th className="text-left py-3 px-3 text-slate-400">Kąt</th>
                     <th className="text-left py-3 px-3 text-slate-400">Status</th>
+                    <th className="text-left py-3 px-3 text-slate-400">Urządzenie</th>
                     <th className="text-left py-3 px-3 text-slate-400">Lokalizacja</th>
                     <th className="text-left py-3 px-3 text-slate-400">Czas</th>
                     <th className="text-left py-3 px-3 text-slate-400">Akcja</th>
@@ -255,22 +304,28 @@ export default function AdminDashboard() {
                 </thead>
                 <tbody>
                   {attempts.map((a: any, idx: number) => {
-                    const isLocked = lockedIPs.includes(a.ipAddress);
+                    const isLocked = lockedIPs.includes(a.ipAddress) || (a.fingerprint && lockedIPs.includes(a.fingerprint));
                     return (
                       <tr key={idx} className={`border-b border-slate-700/50 hover:bg-slate-700/20 ${isLocked ? "bg-red-900/20" : ""}`}>
                         <td className={`py-3 px-3 ${isLocked ? "text-red-400 font-bold" : "text-slate-300"}`}>{a.ipAddress}</td>
                         <td className="py-3 px-3 text-slate-300 font-bold">{a.angle}{"\u00B0"}</td>
                         <td className="py-3 px-3">{a.isCorrect === 1 ? <span className="text-green-400 flex items-center gap-1 font-bold"><CheckCircle2 className="w-4 h-4" />OK</span> : <span className="text-red-400 flex items-center gap-1 font-bold"><XCircle className="w-4 h-4" />FAIL</span>}</td>
+                        <td className="py-3 px-3">
+                          <div className="flex flex-col">
+                            <span className="text-[11px] text-purple-300 font-mono bg-purple-500/10 border border-purple-500/20 px-2 py-0.5 rounded w-fit">{a.fingerprint ? `${a.fingerprint.slice(0,8)}...` : a.browserFamily ? `${a.browserFamily}` : '—'}</span>
+                            {a.fingerprint && <span className="text-[10px] text-slate-500 mt-0.5">{a.osFamily || ''} • {a.deviceType || 'desktop'}</span>}
+                          </div>
+                        </td>
                         <td className="py-3 px-3 overflow-visible">
                           <div className="group relative inline-block">
                             <span className="flex items-center gap-1.5 cursor-help border-b border-dotted border-slate-500 hover:text-cyan-300 text-slate-300">
-                              <span>{getFlag(a.country)}</span><span className="text-slate-200">{a.country}</span>{a.city && <span className="text-slate-400 text-xs">({a.city})</span>}
+                              <span>{getFlag(a.country, a.countryCode || a.country_code)}</span><span className="text-slate-200">{a.country}</span>{a.city && <span className="text-slate-400 text-xs">({a.city})</span>}
                             </span>
                             <IpTooltip a={a} />
                           </div>
                         </td>
                         <td className="py-3 px-3 text-slate-400 text-xs">{a.createdAt ? new Date(a.createdAt).toLocaleString("pl-PL") : ""}</td>
-                        <td className="py-3 px-3"><UnlockButton ipAddress={a.ipAddress} /></td>
+                        <td className="py-3 px-3"><UnlockButton ipAddress={a.fingerprint || a.ipAddress} /></td>
                       </tr>
                     );
                   })}
