@@ -8,6 +8,8 @@ import { parseUserAgent } from "./userAgentParser";
 import crypto from "crypto";
 
 const MAX_ATTEMPTS = 2;
+const MAX_SUBNET_ATTEMPTS = 3; // /24 – łapie wszystkie IP z tej samej puli VPN
+const MAX_GEO_ATTEMPTS = 4; // miasto+ISP – łapie całe domowe WiFi nawet po zmianie IP
 const LOCKOUT_MS = 24 * 60 * 60 * 1000;
 const VPN_DETECTION_WINDOW_MS = 60 * 60 * 1000;
 
@@ -52,6 +54,42 @@ const attemptStore = new Map<string, AttemptRecord>();
 const historyStore: HistoryEntry[] = [];
 const geoCache = new Map<string, any>();
 
+// --- HELPERS: subnet + geoKey ---
+function getSubnet(ip: string): string | null {
+  if (!ip || ip.includes(':') || ip.startsWith('fallback') || ip === 'unknown' || ip.startsWith('192.168') || ip.startsWith('10.') ) return null;
+  // 127.0.0.1 też ignorujemy, ale dla testów można zostawić
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  if (parts.some(p => isNaN(Number(p)))) return null;
+  return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+}
+
+function sanitizeGeoPart(s: string): string {
+  return s.trim().replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_\-]/g, '').slice(0,30) || 'unknown';
+}
+
+function getGeoKey(geo: any): string | null {
+  if (!geo) return null;
+  const city = sanitizeGeoPart(geo.city || '');
+  const isp = sanitizeGeoPart(geo.isp || geo.org || '');
+  if (city === 'unknown' && isp === 'unknown') return null;
+  if (city === 'Unknown' && isp === 'Unknown') return null;
+  return `geo:${city}-${isp}`.slice(0,80);
+}
+
+function getGeoKeyFromHistory(h: HistoryEntry): string | null {
+  const city = sanitizeGeoPart(h.city || '');
+  const isp = sanitizeGeoPart(h.isp || h.org || '');
+  if (!city || city === 'unknown') return null;
+  return `geo:${city}-${isp}`.slice(0,80);
+}
+
+function getMaxForKey(key: string): number {
+  if (key.startsWith('geo:')) return MAX_GEO_ATTEMPTS;
+  if (key.includes('/24')) return MAX_SUBNET_ATTEMPTS;
+  return MAX_ATTEMPTS;
+}
+
 function getOrCreateRecord(key: string) {
   let rec = attemptStore.get(key);
   if (!rec) {
@@ -75,15 +113,18 @@ async function getRemainingLockoutTime(key: string) {
 }
 async function recordFailedAttempt(key: string, ip: string, fingerprint?: string) {
   const rec = getOrCreateRecord(key);
+  const max = getMaxForKey(key);
   rec.failedAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
   if (fingerprint) rec.fingerprints.add(fingerprint);
   if (rec.ips.size > 1) rec.isRepeatedOffender = true;
   let isLockedNow = false; let lockedUntil: Date | null = null;
-  if (rec.failedAttempts >= MAX_ATTEMPTS) { isLockedNow = true; lockedUntil = new Date(Date.now() + LOCKOUT_MS); rec.lockedUntil = lockedUntil; }
-  return { remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failedAttempts), isLocked: isLockedNow, lockedUntil };
+  if (rec.failedAttempts >= max) { isLockedNow = true; lockedUntil = new Date(Date.now() + LOCKOUT_MS); rec.lockedUntil = lockedUntil; }
+  return { remainingAttempts: Math.max(0, max - rec.failedAttempts), isLocked: isLockedNow, lockedUntil, max };
 }
 async function resetAttempts(keys: string[], ip: string, fingerprint?: string) {
   for (const key of keys) {
+    // geo nie resetujemy automatycznie przy sukcesie jednego usera – żeby nie odblokować całego miasta
+    if (key.startsWith('geo:')) continue;
     const rec = getOrCreateRecord(key);
     rec.failedAttempts = 0; rec.lockedUntil = null; rec.successfulAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
     if (fingerprint) rec.fingerprints.add(fingerprint);
@@ -135,22 +176,25 @@ export const appRouter = router({
     }),
   }),
   angle: router({
-    // FIXED: procedura nazywa się status (tak jak woła ją Home.tsx) + alias getStatus dla kompatybilności
     status: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() }).optional()).query(async ({ ctx, input }) => {
       const ip = getClientIp(ctx.req); 
       let deviceId = input?.deviceId || getDeviceId(ctx.req); 
       const fingerprint = input?.fingerprint || "";
+      const subnet = getSubnet(ip);
+      let geoKey: string | null = null;
+      try { const geo = await fetchGeo(ip); geoKey = getGeoKey(geo); } catch {}
       const primaryKey = fingerprint || deviceId || ip; 
-      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
+      const keysToCheck = Array.from(new Set([primaryKey, ip, subnet, deviceId, fingerprint, geoKey].filter(Boolean))) as string[];
       for (const k of keysToCheck) { 
         if (await isLocked(k)) {
           const ms = await getRemainingLockoutTime(k);
           return { 
             isLocked: true, locked: true, 
-            failedAttempts: MAX_ATTEMPTS, 
+            failedAttempts: getMaxForKey(k), 
             remainingAttempts: 0, 
             remainingLockoutMs: ms, remainingMs: ms,
-            attemptsLeft: 0, maxAttempts: MAX_ATTEMPTS 
+            attemptsLeft: 0, maxAttempts: getMaxForKey(k),
+            blockedBy: k
           }; 
         } 
       }
@@ -169,17 +213,21 @@ export const appRouter = router({
       const ip = getClientIp(ctx.req); 
       let deviceId = input?.deviceId || getDeviceId(ctx.req); 
       const fingerprint = input?.fingerprint || "";
+      const subnet = getSubnet(ip);
+      let geoKey: string | null = null;
+      try { const geo = await fetchGeo(ip); geoKey = getGeoKey(geo); } catch {}
       const primaryKey = fingerprint || deviceId || ip; 
-      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
+      const keysToCheck = Array.from(new Set([primaryKey, ip, subnet, deviceId, fingerprint, geoKey].filter(Boolean))) as string[];
       for (const k of keysToCheck) { 
         if (await isLocked(k)) {
           const ms = await getRemainingLockoutTime(k);
           return { 
             isLocked: true, locked: true, 
-            failedAttempts: MAX_ATTEMPTS, 
+            failedAttempts: getMaxForKey(k), 
             remainingAttempts: 0, 
             remainingLockoutMs: ms, remainingMs: ms,
-            attemptsLeft: 0, maxAttempts: MAX_ATTEMPTS 
+            attemptsLeft: 0, maxAttempts: getMaxForKey(k),
+            blockedBy: k
           }; 
         } 
       }
@@ -198,21 +246,25 @@ export const appRouter = router({
       (ctx as any).user = { id: 1, openId: "public-user", name: "Gość", email: "guest@example.com", loginMethod: "public", role: "user", createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date() } as any;
       const ip = getClientIp(ctx.req); let deviceId = getDeviceId(ctx.req);
       if (!deviceId) { deviceId = crypto.randomUUID(); if ((ctx.res as any).cookie) (ctx.res as any).cookie('device_id', deviceId, { maxAge: 365*24*60*60*1000, httpOnly: true, sameSite: 'lax', path: '/' }); }
-      const fingerprint = input.fingerprint || ""; const primaryKey = fingerprint || deviceId || ip;
-      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
+      const fingerprint = input.fingerprint || ""; 
+      const subnet = getSubnet(ip);
+      const ua = ctx.req.headers["user-agent"] || "unknown"; const parsedUA = parseUserAgent(ua); if (input.browser) parsedUA.browserFamily = input.browser as any;
+      const geo = await fetchGeo(ip); 
+      const geoKey = getGeoKey(geo);
+      const primaryKey = fingerprint || deviceId || ip;
+      const keysToCheck = Array.from(new Set([primaryKey, ip, subnet, deviceId, fingerprint, geoKey].filter(Boolean))) as string[];
 
-      for (const k of keysToCheck) { if (await isLocked(k)) { return { success: false, reason: "locked", remainingLockoutMs: await getRemainingLockoutTime(k) }; } }
+      for (const k of keysToCheck) { if (await isLocked(k)) { return { success: false, reason: "locked", remainingLockoutMs: await getRemainingLockoutTime(k), blockedBy: k }; } }
 
       const correctAngle = 65; const tolerance = 0.5; const isCorrect = input.angle >= correctAngle - tolerance && input.angle <= correctAngle + tolerance;
-      const ua = ctx.req.headers["user-agent"] || "unknown"; const parsedUA = parseUserAgent(ua); if (input.browser) parsedUA.browserFamily = input.browser as any;
-      const geo = await fetchGeo(ip); const isVpn = detectVpnUsage(fingerprint, ip, geo);
+      const isVpn = detectVpnUsage(fingerprint, ip, geo);
       await addHistory(ip, fingerprint, deviceId, input.angle, isCorrect, ua, parsedUA, geo, isVpn);
 
       if (isCorrect) { await resetAttempts(keysToCheck, ip, fingerprint); return { success: true, reason: "correct", angle: input.angle }; }
       else {
         let lastResult: any = null;
         for (const k of keysToCheck) { lastResult = await recordFailedAttempt(k, ip, fingerprint); }
-        return { success: false, reason: isVpn? "vpn_detected" : "incorrect", remainingAttempts: lastResult.remainingAttempts, isLocked: lastResult.isLocked, lockedUntil: lastResult.lockedUntil, remainingLockoutMs: lastResult.isLocked? (lastResult.lockedUntil?.getTime() || 0) - Date.now() : 0, isVpn };
+        return { success: false, reason: isVpn? "vpn_detected" : "incorrect", remainingAttempts: lastResult.remainingAttempts, isLocked: lastResult.isLocked, lockedUntil: lastResult.lockedUntil, remainingLockoutMs: lastResult.isLocked? (lastResult.lockedUntil?.getTime() || 0) - Date.now() : 0, isVpn, blockedBy: lastResult.isLocked ? keysToCheck : undefined };
       }
     }),
   }),
@@ -239,50 +291,66 @@ export const appRouter = router({
       const headers = ["ID","IP","Fingerprint","DeviceID","Kat","Poprawny","Data","Przegladarka","OS","Miasto","Kraj","VPN"]; const rows = historyStore.map(h => [h.id, h.ipAddress, h.fingerprint, h.deviceId, String(h.angle), h.isCorrect? "TAK":"NIE", h.createdAt.toISOString(), h.browserFamily, h.osFamily, h.city, h.country, h.isVpn? "TAK" : "NIE"]);
       return [headers.join(","),...rows.map(r => r.map(v=>`"${v}"`).join(","))].join("\n");
     }),
-    // FIXED: odblokowuje IP + fingerprint + deviceId powiązane razem
-    unlockIp: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional() })).mutation(async ({ input }) => {
-      const initialKeys = [input.fingerprint, input.deviceId, input.ipAddress].filter(Boolean) as string[];
+    // HARDENED: odblokowuje IP + /24 + geo + fingerprint + deviceId
+    unlockIp: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional(), subnet: z.string().optional(), geoKey: z.string().optional() })).mutation(async ({ input }) => {
+      const initialKeys = [input.fingerprint, input.deviceId, input.ipAddress, input.subnet, input.geoKey].filter(Boolean) as string[];
       if (initialKeys.length === 0) return { success: false, message: "Brak ID do odblokowania" };
       
       const keysToDelete = new Set<string>(initialKeys);
 
-      // 1. Znajdź wszystkie wpisy w historii które pasują do klucza i dodaj ich IP/fingerprint/deviceId
+      // jeśli podano IP, dorzuć jego /24
+      if (input.ipAddress) {
+        const s = getSubnet(input.ipAddress);
+        if (s) keysToDelete.add(s);
+      }
+
+      // 1. historia -> zbierz powiązane IP/fingerprint/deviceId + subnet + geo
       for (const h of historyStore) {
-        const matches = initialKeys.some(k => k === h.ipAddress || k === h.fingerprint || k === h.deviceId);
+        const matches = initialKeys.some(k => k === h.ipAddress || k === h.fingerprint || k === h.deviceId || k === getSubnet(h.ipAddress) || k === getGeoKeyFromHistory(h));
         if (matches) {
-          if (h.ipAddress) keysToDelete.add(h.ipAddress);
+          if (h.ipAddress) {
+            keysToDelete.add(h.ipAddress);
+            const s = getSubnet(h.ipAddress);
+            if (s) keysToDelete.add(s);
+          }
           if (h.fingerprint && h.fingerprint !== "unknown") keysToDelete.add(h.fingerprint);
           if (h.deviceId && h.deviceId !== "unknown") keysToDelete.add(h.deviceId);
+          const gk = getGeoKeyFromHistory(h);
+          if (gk) keysToDelete.add(gk);
         }
       }
 
-      // 2. Sprawdź attemptStore - jeśli rekord zawiera któryś z kluczy w swoich zbiorach, dodaj cały rekord
+      // 2. attemptStore
       for (const [storeKey, rec] of attemptStore.entries()) {
         const shouldDelete = keysToDelete.has(storeKey) || initialKeys.some(k => rec.ips.has(k) || rec.fingerprints.has(k));
         if (shouldDelete) {
           keysToDelete.add(storeKey);
-          rec.ips.forEach(ip => keysToDelete.add(ip));
+          rec.ips.forEach(ip => {
+            keysToDelete.add(ip);
+            const s = getSubnet(ip);
+            if (s) keysToDelete.add(s);
+          });
           rec.fingerprints.forEach(fp => { if (fp !== "unknown") keysToDelete.add(fp); });
         }
       }
 
-      // 3. Drugi przebieg - upewnij się że wszystkie powiązane klucze też zostaną usunięte
+      // 3. drugi przebieg
       for (const k of Array.from(keysToDelete)) {
         const rec = attemptStore.get(k);
         if (rec) {
-          rec.ips.forEach(ip => keysToDelete.add(ip));
+          rec.ips.forEach(ip => {
+            keysToDelete.add(ip);
+            const s = getSubnet(ip);
+            if (s) keysToDelete.add(s);
+          });
           rec.fingerprints.forEach(fp => { if (fp !== "unknown") keysToDelete.add(fp); });
         }
       }
 
-      // 4. Usuń wszystko
       let deletedCount = 0;
       for (const k of keysToDelete) {
         if (attemptStore.delete(k)) deletedCount++;
       }
-
-      // 5. Wyczyść też geoCache dla IP jeśli potrzeba (opcjonalnie)
-      // nie czyścimy historii - zostaje do audytu
 
       return { success: true, deletedKeys: Array.from(keysToDelete), deletedCount };
     }),
