@@ -262,9 +262,27 @@ export const appRouter = router({
 
       if (isCorrect) { await resetAttempts(keysToCheck, ip, fingerprint); return { success: true, reason: "correct", angle: input.angle }; }
       else {
-        let lastResult: any = null;
-        for (const k of keysToCheck) { lastResult = await recordFailedAttempt(k, ip, fingerprint); }
-        return { success: false, reason: isVpn? "vpn_detected" : "incorrect", remainingAttempts: lastResult.remainingAttempts, isLocked: lastResult.isLocked, lockedUntil: lastResult.lockedUntil, remainingLockoutMs: lastResult.isLocked? (lastResult.lockedUntil?.getTime() || 0) - Date.now() : 0, isVpn, blockedBy: lastResult.isLocked ? keysToCheck : undefined };
+        const allResults: Array<{key:string, r:any}> = [];
+        for (const k of keysToCheck) { const r = await recordFailedAttempt(k, ip, fingerprint); allResults.push({key:k, r}); }
+        const locked = allResults.filter(x=>x.r.isLocked);
+        if (locked.length > 0) {
+          const firstLocked = locked[0];
+          return { 
+            success: false, 
+            reason: "locked", 
+            remainingAttempts: 0, 
+            remaining: 0,
+            isLocked: true, 
+            locked: true,
+            lockedUntil: firstLocked.r.lockedUntil, 
+            remainingLockoutMs: firstLocked.r.lockedUntil ? firstLocked.r.lockedUntil.getTime() - Date.now() : LOCKOUT_MS,
+            isVpn, 
+            blockedBy: firstLocked.key,
+            allBlockedBy: locked.map(x=>x.key)
+          };
+        }
+        const minRemaining = Math.min(...allResults.map(x=>x.r.remainingAttempts));
+        return { success: false, reason: isVpn? "vpn_detected" : "incorrect", remainingAttempts: minRemaining, remaining: minRemaining, isLocked: false, locked: false, isVpn, blockedBy: undefined };
       }
     }),
   }),
