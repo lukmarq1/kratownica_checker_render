@@ -373,8 +373,8 @@ export const appRouter = router({
       return { success: true, deletedKeys: Array.from(keysToDelete), deletedCount };
     }),
     verifyPin: publicProcedure.input(z.object({ pin: z.string() })).mutation(async ({ input }) => { const adminPin = ENV.adminPin; if (!adminPin) return { success: false, error: "Admin PIN not configured" }; return { success: input.pin === adminPin }; }),
-    // FIX React #310: zwracamy tylko IP/fingerprint/deviceId. geo: i /24 blokują dalej po stronie serwera, ale nie psują hooków w map() w AdminDashboard
-    getLockedIPs: publicProcedure.query(async () => { const locked: string[] = []; for (const [key, rec] of attemptStore.entries()) { if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) { if (key.startsWith('geo:') || key.includes('/24')) continue; locked.push(key); } } return locked; }),
+    // po fixie hooków w AdminDashboard możemy znowu zwracać pełną listę z geo i /24
+    getLockedIPs: publicProcedure.query(async () => { const locked: string[] = []; for (const [key, rec] of attemptStore.entries()) { if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) locked.push(key); } return locked; }),
     getLockedAll: publicProcedure.query(async () => { const locked: any[] = []; for (const [key, rec] of attemptStore.entries()) { if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) locked.push({ key, type: key.startsWith('geo:') ? 'geo' : key.includes('/24') ? 'subnet' : 'device', lockedUntil: rec.lockedUntil, failedAttempts: rec.failedAttempts }); } return locked; }),
   }),
 });
