@@ -135,12 +135,64 @@ export const appRouter = router({
     }),
   }),
   angle: router({
-    getStatus: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
-      const ip = getClientIp(ctx.req); let deviceId = input.deviceId || getDeviceId(ctx.req); const fingerprint = input.fingerprint || "";
-      const primaryKey = fingerprint || deviceId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
-      for (const k of keysToCheck) { if (await isLocked(k)) return { locked: true, remainingMs: await getRemainingLockoutTime(k) }; }
-      const rec = attemptStore.get(primaryKey); const attemptsLeft = rec? Math.max(0, MAX_ATTEMPTS - rec.failedAttempts) : MAX_ATTEMPTS;
-      return { locked: false, attemptsLeft, maxAttempts: MAX_ATTEMPTS };
+    // FIXED: procedura nazywa się status (tak jak woła ją Home.tsx) + alias getStatus dla kompatybilności
+    status: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() }).optional()).query(async ({ ctx, input }) => {
+      const ip = getClientIp(ctx.req); 
+      let deviceId = input?.deviceId || getDeviceId(ctx.req); 
+      const fingerprint = input?.fingerprint || "";
+      const primaryKey = fingerprint || deviceId || ip; 
+      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
+      for (const k of keysToCheck) { 
+        if (await isLocked(k)) {
+          const ms = await getRemainingLockoutTime(k);
+          return { 
+            isLocked: true, locked: true, 
+            failedAttempts: MAX_ATTEMPTS, 
+            remainingAttempts: 0, 
+            remainingLockoutMs: ms, remainingMs: ms,
+            attemptsLeft: 0, maxAttempts: MAX_ATTEMPTS 
+          }; 
+        } 
+      }
+      const rec = attemptStore.get(primaryKey); 
+      const failed = rec?.failedAttempts || 0;
+      const attemptsLeft = Math.max(0, MAX_ATTEMPTS - failed);
+      return { 
+        isLocked: false, locked: false, 
+        failedAttempts: failed, 
+        remainingAttempts: attemptsLeft, 
+        remainingLockoutMs: 0, remainingMs: 0,
+        attemptsLeft, maxAttempts: MAX_ATTEMPTS 
+      };
+    }),
+    getStatus: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() }).optional()).query(async ({ ctx, input }) => {
+      const ip = getClientIp(ctx.req); 
+      let deviceId = input?.deviceId || getDeviceId(ctx.req); 
+      const fingerprint = input?.fingerprint || "";
+      const primaryKey = fingerprint || deviceId || ip; 
+      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
+      for (const k of keysToCheck) { 
+        if (await isLocked(k)) {
+          const ms = await getRemainingLockoutTime(k);
+          return { 
+            isLocked: true, locked: true, 
+            failedAttempts: MAX_ATTEMPTS, 
+            remainingAttempts: 0, 
+            remainingLockoutMs: ms, remainingMs: ms,
+            attemptsLeft: 0, maxAttempts: MAX_ATTEMPTS 
+          }; 
+        } 
+      }
+      const rec = attemptStore.get(primaryKey); 
+      const failed = rec?.failedAttempts || 0;
+      const attemptsLeft = Math.max(0, MAX_ATTEMPTS - failed);
+      return { 
+        isLocked: false, locked: false, 
+        failedAttempts: failed, 
+        remainingAttempts: attemptsLeft, 
+        remainingLockoutMs: 0, remainingMs: 0,
+        attemptsLeft, maxAttempts: MAX_ATTEMPTS 
+      };
     }),
     verify: publicProcedure.input(z.object({ angle: z.number(), fingerprint: z.string().optional(), deviceId: z.string().optional(), browser: z.string().optional(), os: z.string().optional() })).mutation(async ({ ctx, input }) => {
       (ctx as any).user = { id: 1, openId: "public-user", name: "Gość", email: "guest@example.com", loginMethod: "public", role: "user", createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date() } as any;
