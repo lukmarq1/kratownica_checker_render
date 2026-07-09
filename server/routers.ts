@@ -127,21 +127,22 @@ function getDeviceId(req: any): string {
 export const appRouter = router({
   system: systemRouter,
   auth: router({
-    me: publicProcedure.query(() => null),
-    logout: publicProcedure.mutation(({ ctx }) => {
-      const cookieOptions = getSessionCookieOptions(ctx.req); ctx.res.clearCookie(COOKIE_NAME, {...cookieOptions, maxAge: -1 }); return { success: true } as const;
+    me: publicProcedure.query(async ({ ctx }) => { return (ctx as any).user || null; }),
+    logout: publicProcedure.mutation(async ({ ctx }) => {
+      const cookieOptions = getSessionCookieOptions((ctx.req as any));
+      if ((ctx.res as any).clearCookie) (ctx.res as any).clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return { success: true } as const;
     }),
   }),
   angle: router({
-    status: publicProcedure.input(z.object({ fingerprint: z.string().optional() }).optional()).query(async ({ ctx, input }) => {
-      const ip = getClientIp(ctx.req); const deviceId = getDeviceId(ctx.req); const primaryKey = input?.fingerprint || deviceId || ip;
-      const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, input?.fingerprint].filter(Boolean))) as string[];
-      let locked = false; let remainingMs = 0;
-      for (const k of keysToCheck) { if (await isLocked(k)) { locked = true; remainingMs = await getRemainingLockoutTime(k); break; } }
-      const rec = getOrCreateRecord(primaryKey);
-      return { isLocked: locked, failedAttempts: rec.failedAttempts, remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failedAttempts), remainingLockoutMs: remainingMs, isRepeatedOffender: rec.isRepeatedOffender, ips: Array.from(rec.ips) };
+    getStatus: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
+      const ip = getClientIp(ctx.req); let deviceId = input.deviceId || getDeviceId(ctx.req); const fingerprint = input.fingerprint || "";
+      const primaryKey = fingerprint || deviceId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
+      for (const k of keysToCheck) { if (await isLocked(k)) return { locked: true, remainingMs: await getRemainingLockoutTime(k) }; }
+      const rec = attemptStore.get(primaryKey); const attemptsLeft = rec? Math.max(0, MAX_ATTEMPTS - rec.failedAttempts) : MAX_ATTEMPTS;
+      return { locked: false, attemptsLeft, maxAttempts: MAX_ATTEMPTS };
     }),
-    verify: publicProcedure.input(z.object({ angle: z.number().min(0).max(360), browser: z.string().optional(), fingerprint: z.string().optional() })).mutation(async ({ input, ctx }) => {
+    verify: publicProcedure.input(z.object({ angle: z.number(), fingerprint: z.string().optional(), deviceId: z.string().optional(), browser: z.string().optional(), os: z.string().optional() })).mutation(async ({ ctx, input }) => {
       (ctx as any).user = { id: 1, openId: "public-user", name: "Gość", email: "guest@example.com", loginMethod: "public", role: "user", createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date() } as any;
       const ip = getClientIp(ctx.req); let deviceId = getDeviceId(ctx.req);
       if (!deviceId) { deviceId = crypto.randomUUID(); if ((ctx.res as any).cookie) (ctx.res as any).cookie('device_id', deviceId, { maxAge: 365*24*60*60*1000, httpOnly: true, sameSite: 'lax', path: '/' }); }
@@ -186,7 +187,53 @@ export const appRouter = router({
       const headers = ["ID","IP","Fingerprint","DeviceID","Kat","Poprawny","Data","Przegladarka","OS","Miasto","Kraj","VPN"]; const rows = historyStore.map(h => [h.id, h.ipAddress, h.fingerprint, h.deviceId, String(h.angle), h.isCorrect? "TAK":"NIE", h.createdAt.toISOString(), h.browserFamily, h.osFamily, h.city, h.country, h.isVpn? "TAK" : "NIE"]);
       return [headers.join(","),...rows.map(r => r.map(v=>`"${v}"`).join(","))].join("\n");
     }),
-    unlockIp: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional() })).mutation(async ({ input }) => { const keys = [input.fingerprint, input.deviceId, input.ipAddress].filter(Boolean) as string[]; for (const k of keys) attemptStore.delete(k); return { success: true, keys }; }),
+    // FIXED: odblokowuje IP + fingerprint + deviceId powiązane razem
+    unlockIp: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional() })).mutation(async ({ input }) => {
+      const initialKeys = [input.fingerprint, input.deviceId, input.ipAddress].filter(Boolean) as string[];
+      if (initialKeys.length === 0) return { success: false, message: "Brak ID do odblokowania" };
+      
+      const keysToDelete = new Set<string>(initialKeys);
+
+      // 1. Znajdź wszystkie wpisy w historii które pasują do klucza i dodaj ich IP/fingerprint/deviceId
+      for (const h of historyStore) {
+        const matches = initialKeys.some(k => k === h.ipAddress || k === h.fingerprint || k === h.deviceId);
+        if (matches) {
+          if (h.ipAddress) keysToDelete.add(h.ipAddress);
+          if (h.fingerprint && h.fingerprint !== "unknown") keysToDelete.add(h.fingerprint);
+          if (h.deviceId && h.deviceId !== "unknown") keysToDelete.add(h.deviceId);
+        }
+      }
+
+      // 2. Sprawdź attemptStore - jeśli rekord zawiera któryś z kluczy w swoich zbiorach, dodaj cały rekord
+      for (const [storeKey, rec] of attemptStore.entries()) {
+        const shouldDelete = keysToDelete.has(storeKey) || initialKeys.some(k => rec.ips.has(k) || rec.fingerprints.has(k));
+        if (shouldDelete) {
+          keysToDelete.add(storeKey);
+          rec.ips.forEach(ip => keysToDelete.add(ip));
+          rec.fingerprints.forEach(fp => { if (fp !== "unknown") keysToDelete.add(fp); });
+        }
+      }
+
+      // 3. Drugi przebieg - upewnij się że wszystkie powiązane klucze też zostaną usunięte
+      for (const k of Array.from(keysToDelete)) {
+        const rec = attemptStore.get(k);
+        if (rec) {
+          rec.ips.forEach(ip => keysToDelete.add(ip));
+          rec.fingerprints.forEach(fp => { if (fp !== "unknown") keysToDelete.add(fp); });
+        }
+      }
+
+      // 4. Usuń wszystko
+      let deletedCount = 0;
+      for (const k of keysToDelete) {
+        if (attemptStore.delete(k)) deletedCount++;
+      }
+
+      // 5. Wyczyść też geoCache dla IP jeśli potrzeba (opcjonalnie)
+      // nie czyścimy historii - zostaje do audytu
+
+      return { success: true, deletedKeys: Array.from(keysToDelete), deletedCount };
+    }),
     verifyPin: publicProcedure.input(z.object({ pin: z.string() })).mutation(async ({ input }) => { const adminPin = ENV.adminPin; if (!adminPin) return { success: false, error: "Admin PIN not configured" }; return { success: input.pin === adminPin }; }),
     getLockedIPs: publicProcedure.query(async () => { const locked: string[] = []; for (const [key, rec] of attemptStore.entries()) { if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) locked.push(key); } return locked; }),
   }),
