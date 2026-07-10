@@ -63,7 +63,26 @@ async function getApp() {
 async function startServer() {
   const app = await getApp();
   const port = Number(process.env.PORT) || 10000;
-  console.log("[Database] Skipped - in-memory mode");
+
+  // --- FIX: Prawdziwa inicjalizacja bazy z obsługą Aiven ---
+  try {
+    const dbMod = await import("./db");
+    const getDb = dbMod.getDb || (dbMod.default && dbMod.default.getDb);
+    if (typeof getDb === "function") {
+      const db = getDb();
+      if (db) {
+        console.log("[Database] Connected - will use MySQL (via _core/db.ts)");
+      } else {
+        console.log("[Database] No DATABASE_URL or init failed - running in-memory mode");
+        console.log("[Database] ENV check: DATABASE_URL present =",!!process.env.DATABASE_URL, "len =", String(process.env.DATABASE_URL || "").length);
+      }
+    } else {
+      console.log("[Database] getDb not found in./db, running in-memory");
+    }
+  } catch (e: any) {
+    console.log("[Database] Init error, fallback to memory:", e?.message || e);
+  }
+
   app.listen(port, () => {
     console.log(`Server running on port ${port}`);
   });
