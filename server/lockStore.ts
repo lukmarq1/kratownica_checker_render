@@ -1,6 +1,6 @@
 import { eq, desc, sql } from "drizzle-orm";
-import { getDb } from "./_core/db";
-import { attemptHistory, lockKeys } from "../../drizzle/schema";
+import { getDb } from "./db";
+import { attemptHistory, lockKeys } from "../drizzle/schema";
 
 const MAX_ATTEMPTS = 2;
 const LOCKOUT_MS = 24 * 60 * 60 * 1000;
@@ -40,7 +40,7 @@ export async function addHistory(
     fingerprint: fingerprint || "unknown",
     deviceId: deviceId || "unknown",
     angle,
-    isCorrect: isCorrect ? 1 : 0,
+    isCorrect: isCorrect? 1 : 0,
     country: geo?.country || "Unknown",
     city: geo?.city || "Unknown",
     zip: geo?.zip || "",
@@ -54,13 +54,13 @@ export async function addHistory(
     osFamily: parsedUA?.osFamily || parsedUA?.os || "Unknown",
     deviceType: parsedUA?.deviceType || parsedUA?.device || "desktop",
     userAgent: ua,
-    isVpn: isVpn ? 1 : 0,
+    isVpn: isVpn? 1 : 0,
     createdAt: new Date(),
   };
 
   const db = dbOrNull();
   if (!db) {
-    memHistory.unshift({ ...entry, createdAt: new Date(), timestamp: new Date() });
+    memHistory.unshift({...entry, createdAt: new Date(), timestamp: new Date() });
     if (memHistory.length > 1000) memHistory.pop();
     return;
   }
@@ -69,7 +69,7 @@ export async function addHistory(
     await db.insert(attemptHistory).values(entry as any);
   } catch (e) {
     console.error("[DB] addHistory failed, fallback to memory", e);
-    memHistory.unshift({ ...entry, createdAt: new Date(), timestamp: new Date() });
+    memHistory.unshift({...entry, createdAt: new Date(), timestamp: new Date() });
   }
 }
 
@@ -78,11 +78,11 @@ export async function getAllHistory(limit = 100, offset = 0) {
   if (!db) return memHistory.slice(offset, offset + limit);
   try {
     const rows = await db
-      .select()
-      .from(attemptHistory)
-      .orderBy(desc(attemptHistory.createdAt))
-      .limit(limit)
-      .offset(offset);
+     .select()
+     .from(attemptHistory)
+     .orderBy(desc(attemptHistory.createdAt))
+     .limit(limit)
+     .offset(offset);
     return rows;
   } catch (e) {
     console.error("[DB] getAllHistory failed", e);
@@ -119,7 +119,7 @@ export async function getStats() {
     failedAttempts: total - ok,
     currentlyLockedIps: lockedCount,
     lockedIPs: lockedCount,
-    successRate: total ? Math.round((ok / total) * 100) : 0,
+    successRate: total? Math.round((ok / total) * 100) : 0,
     repeatedOffenders: 0,
     vpnAttempts: vpn,
   };
@@ -173,7 +173,7 @@ export async function recordFailedAttempt(key: string, ip: string, fingerprint?:
     return {
       remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failed),
       isLocked: rec.failed >= MAX_ATTEMPTS,
-      lockedUntil: rec.failed >= MAX_ATTEMPTS ? new Date(rec.lockedUntil) : null,
+      lockedUntil: rec.failed >= MAX_ATTEMPTS? new Date(rec.lockedUntil) : null,
     };
   }
 
@@ -184,15 +184,12 @@ export async function recordFailedAttempt(key: string, ip: string, fingerprint?:
 
     if (failed >= MAX_ATTEMPTS) {
       await db.insert(lockKeys).values({ id: key, lockedUntil: lockedUntilDate, failedAttempts: failed } as any)
-        .onDuplicateKeyUpdate({ set: { lockedUntil: lockedUntilDate, failedAttempts: failed } as any });
+       .onDuplicateKeyUpdate({ set: { lockedUntil: lockedUntilDate, failedAttempts: failed } as any });
       return { remainingAttempts: 0, isLocked: true, lockedUntil: lockedUntilDate };
     } else {
       await db.insert(lockKeys).values({ id: key, lockedUntil: new Date(Date.now() + 60*1000), failedAttempts: failed } as any)
-        .onDuplicateKeyUpdate({ set: { failedAttempts: failed, lockedUntil: new Date(Date.now() + 60*1000) } as any });
-      // od razu nadpisz na realną blokadę tylko gdy >= MAX, inaczej ustawiamy przyszłą datę ale isLocked=false, więc trzymamy licznik
-      // prościej: jeśli nie zablokowany, usuń blokadę ale zostaw licznik
+       .onDuplicateKeyUpdate({ set: { failedAttempts: failed, lockedUntil: new Date(Date.now() + 60*1000) } as any });
       if (failed < MAX_ATTEMPTS) {
-        // nie blokujemy jeszcze, ale licznik zostaje
         return { remainingAttempts: Math.max(0, MAX_ATTEMPTS - failed), isLocked: false, lockedUntil: null };
       }
       return { remainingAttempts: 0, isLocked: true, lockedUntil: lockedUntilDate };
