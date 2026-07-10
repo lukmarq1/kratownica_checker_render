@@ -7,11 +7,13 @@ import { z } from "zod";
 import { parseUserAgent } from "./userAgentParser";
 import crypto from "crypto";
 
+// ULTIMATE ANTI-CHEAT: WiFi + 24h pamięć + INSTANT VPN BAN
 const MAX_ATTEMPTS = 2;
 const MAX_SUBNET_ATTEMPTS = 3;
 const MAX_GEO_ATTEMPTS = 4;
 const LOCKOUT_MS = 24 * 60 * 60 * 1000;
 const VPN_DETECTION_WINDOW_MS = 60 * 60 * 1000;
+const RECENT_LINK_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h - łączy VPN <-> WiFi
 
 interface AttemptRecord {
   failedAttempts: number;
@@ -101,7 +103,7 @@ async function fetchGeo(ip: string) {
     const c = new AbortController(); const t = setTimeout(()=>c.abort(),2000);
     const res = await fetch(`https://ipwho.is/${ip}`, { signal: c.signal } as any); clearTimeout(t);
     if (!res.ok) return null; const d = await res.json(); if (!d.success) return null;
-    const g = { country: d.country||"Unknown", city: d.city||"Unknown", zip: d.postal||"", timezone: d.timezone?.id||"", isp: d.connection?.isp||"", org: d.connection?.org||"", as: d.connection?.asn?`AS${d.connection.asn} ${d.connection?.org||""}`:"", latitude: String(d.latitude||""), longitude: String(d.longitude||""), isHosting: d.connection?.hosting||false, isProxy: d.security?.is_proxy||d.security?.is_vpn||false };
+    const g = { country: d.country||"Unknown", city: d.city||"Unknown", zip: d.postal||"", timezone: d.timezone?.id||"", isp: d.connection?.isp||"", org: d.connection?.org||"", as: d.connection?.asn?`AS${d.connection.asn} ${d.connection?.org||""}`:"", latitude: String(d.latitude||""), longitude: String(d.longitude||""), isHosting: d.connection?.hosting||false, isProxy: d.security?.is_proxy||d.security?.is_vpn||d.security?.is_tor||false, isVpnFlag: d.security?.is_vpn||false };
     geoCache.set(ip,g); return g;
   } catch { return null; }
 }
@@ -112,6 +114,18 @@ function detectVpnUsage(fp: string, curIp: string, curGeo: any): boolean {
   const diffIp = recent.some(h=>h.ipAddress!==curIp);
   const diffCountry = curGeo && recent.some(h=>h.country!==curGeo.country);
   return !!(diffIp||diffCountry||curGeo?.isHosting||curGeo?.isProxy);
+}
+function getRecentLinkedKeys(fingerprint: string, deviceId: string): string[] {
+  const now = Date.now();
+  const keys = new Set<string>();
+  for (const h of historyStore) {
+    const sameDevice = (fingerprint && h.fingerprint===fingerprint) || (deviceId && h.deviceId===deviceId);
+    if (!sameDevice) continue;
+    if (now - h.createdAt.getTime() > RECENT_LINK_WINDOW_MS) continue;
+    if (h.ipAddress) { keys.add(h.ipAddress); const s=getSubnet(h.ipAddress); if(s) keys.add(s); }
+    const gk=getGeoKeyFromHistory(h); if(gk) keys.add(gk);
+  }
+  return Array.from(keys);
 }
 async function addHistory(ip:string, fp:string, devId:string, angle:number, correct:boolean, ua:string, parsed:any, geo:any, isVpn:boolean){
   const now=new Date();
@@ -127,11 +141,12 @@ function getClientIp(req:any):string{
 }
 function getDeviceId(req:any):string{ const c=req.headers.cookie||""; const m=c.match(/device_id=([^;]+)/); return m?m[1]:""; }
 
-// wspólna logika statusu - używana przez getStatus i status (alias)
 async function handleGetStatus(ctx:any, input:any){
   const ip=getClientIp(ctx.req); let deviceId=input.deviceId||getDeviceId(ctx.req); const fingerprint=input.fingerprint||"";
   const subnet=getSubnet(ip); const geo=await fetchGeo(ip); const geoKey=getGeoKey(geo);
-  const keysToCheck=Array.from(new Set([fingerprint, deviceId, ip, subnet, geoKey].filter(Boolean) as string[]));
+  const baseKeys=[fingerprint, deviceId, ip, subnet, geoKey].filter(Boolean) as string[];
+  const linkedKeys=getRecentLinkedKeys(fingerprint, deviceId);
+  const keysToCheck=Array.from(new Set([...baseKeys, ...linkedKeys]));
   for(const k of keysToCheck){ if(await isLocked(k)){ return { isLocked:true, locked:true, remainingLockoutMs:await getRemainingLockoutTime(k), remainingMs:await getRemainingLockoutTime(k), blockedBy:k, remainingAttempts:0, attemptsLeft:0, maxAttempts:MAX_ATTEMPTS }; } }
   const primary=fingerprint||deviceId||ip; const rec=primary?attemptStore.get(primary):undefined; const failed=rec?.failedAttempts||0;
   const left=Math.max(0, MAX_ATTEMPTS - failed);
@@ -149,20 +164,51 @@ export const appRouter = router({
     }),
   }),
   angle: router({
-    // obie nazwy - frontend woła `status`, starszy kod woła `getStatus`
     getStatus: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).query(async ({ctx,input})=> handleGetStatus(ctx,input)),
     status: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).query(async ({ctx,input})=> handleGetStatus(ctx,input)),
-
     verify: publicProcedure.input(z.object({angle:z.number(),fingerprint:z.string().optional(),deviceId:z.string().optional(),browser:z.string().optional(),os:z.string().optional()})).mutation(async ({ctx,input})=>{
       (ctx as any).user={id:1,openId:"public-user",name:"Gość",email:"guest@example.com",loginMethod:"public",role:"user",createdAt:new Date(),updatedAt:new Date(),lastSignedIn:new Date()} as any;
       const ip=getClientIp(ctx.req); let deviceId=getDeviceId(ctx.req);
       if(!deviceId){ deviceId=crypto.randomUUID(); if((ctx.res as any).cookie) (ctx.res as any).cookie('device_id',deviceId,{maxAge:365*24*60*60*1000,httpOnly:true,sameSite:'lax',path:'/'}); }
       const fingerprint=input.fingerprint||""; const subnet=getSubnet(ip);
       const ua=ctx.req.headers["user-agent"]||"unknown"; const parsed=parseUserAgent(ua); if(input.browser) parsed.browserFamily=input.browser as any;
-      const geo=await fetchGeo(ip); const geoKey=getGeoKey(geo); const isVpn=detectVpnUsage(fingerprint,ip,geo);
-      const keysToCheck=Array.from(new Set([fingerprint,deviceId,ip,subnet,geoKey].filter(Boolean) as string[]));
+      const geo=await fetchGeo(ip); const geoKey=getGeoKey(geo);
+      
+      // ===== INSTANT VPN / HOSTING / PROXY BAN - bez dawania 2 prób =====
+      const isInstantVpnBan = !!(geo?.isHosting || geo?.isProxy || geo?.isVpnFlag);
+      if (isInstantVpnBan) {
+        const banKeys = [fingerprint, deviceId, ip, subnet, geoKey].filter(Boolean) as string[];
+        const linkedKeys = getRecentLinkedKeys(fingerprint, deviceId);
+        const allBanKeys = Array.from(new Set([...banKeys, ...linkedKeys]));
+        for (const k of allBanKeys) {
+          const rec = getOrCreateRecord(k);
+          rec.failedAttempts = getMaxForKey(k);
+          rec.lockedUntil = new Date(Date.now() + LOCKOUT_MS);
+          rec.ips.add(ip);
+          if (fingerprint) rec.fingerprints.add(fingerprint);
+        }
+        await addHistory(ip,fingerprint,deviceId,input.angle,false,ua,parsed,geo,true);
+        return {
+          success: false,
+          reason: "vpn_detected",
+          isVpn: true,
+          isLocked: true,
+          locked: true,
+          remainingAttempts: 0,
+          remaining: 0,
+          remainingLockoutMs: LOCKOUT_MS,
+          blockedBy: geoKey || subnet || ip,
+          message: `🔒 Wykryto VPN/Proxy/Hosting (${geo?.isp||geo?.org||"VPN"}) - blokada 24h bez prób`
+        };
+      }
+      // ===== KONIEC INSTANT BAN =====
+
+      const baseKeys=[fingerprint,deviceId,ip,subnet,geoKey].filter(Boolean) as string[];
+      const linkedKeys=getRecentLinkedKeys(fingerprint, deviceId);
+      const keysToCheck=Array.from(new Set([...baseKeys, ...linkedKeys]));
       for(const k of keysToCheck){ if(await isLocked(k)){ return {success:false,reason:"locked",remainingLockoutMs:await getRemainingLockoutTime(k),blockedBy:k}; } }
       const correctAngle=65; const tol=0.5; const isCorrect=input.angle>=correctAngle-tol && input.angle<=correctAngle+tol;
+      const isVpn=detectVpnUsage(fingerprint,ip,geo);
       await addHistory(ip,fingerprint,deviceId,input.angle,isCorrect,ua,parsed,geo,isVpn);
       if(isCorrect){ await resetAttempts(keysToCheck,ip,fingerprint); return {success:true,reason:"correct",angle:input.angle}; }
       else{
