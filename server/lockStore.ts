@@ -1,343 +1,231 @@
 import { eq, desc, sql } from "drizzle-orm";
-import { getDb } from "./db";
-import { lockKeys, attemptHistory, type LockKey } from "../drizzle/schema";
+import { getDb } from "./_core/db";
+import { attemptHistory, lockKeys } from "../../drizzle/schema";
 
-// =====================================================================
-// Trwały magazyn blokad, oparty o MySQL (tabela `lock_keys`).
-// Zastępuje dawne `attemptStore` / `historyStore` (Map/Array w pamięci
-// procesu), które gubiły się przy restarcie serwera i były niespójne
-// przy >1 instancji.
-//
-// Jeśli baza jest chwilowo niedostępna, spadamy na awaryjny magazyn
-// w pamięci (tylko dla bieżącego procesu) — appka dalej działa, ale
-// bez trwałości. To wyłącznie fallback na wypadek przerwy w połączeniu
-// z DB, nie stan docelowy.
-// =====================================================================
+const MAX_ATTEMPTS = 2;
+const LOCKOUT_MS = 24 * 60 * 60 * 1000;
 
-interface MemRecord {
-  failedAttempts: number;
-  lockedUntil: Date | null;
-  totalAttempts: number;
-  successfulAttempts: number;
-  ips: Set<string>;
-  fingerprints: Set<string>;
-  isRepeatedOffender: boolean;
-}
-const memFallback = new Map<string, MemRecord>();
+// fallback w pamięci jeśli DB nie działa
+const memLocks = new Map<string, { lockedUntil: number; failed: number }>();
+const memHistory: any[] = [];
 
-function parseJsonArray(s: string | null | undefined): string[] {
-  if (!s) return [];
+function dbOrNull() {
   try {
-    const v = JSON.parse(s);
-    return Array.isArray(v) ? v : [];
-  } catch {
-    return [];
-  }
-}
-
-function keyType(key: string): string {
-  if (key.startsWith("asn:")) return "asn";
-  if (key.startsWith("geo:")) return "geo";
-  if (key.includes("/24") || key.startsWith("v6:")) return "subnet";
-  if (key.includes(".") && /^\d+\.\d+\.\d+\.\d+$/.test(key)) return "ip";
-  if (key.includes(":")) return "ip"; // raw ipv6 (not bucketed)
-  return "device"; // fingerprint / deviceId
-}
-
-async function dbOrNull() {
-  try {
-    return await getDb();
-  } catch {
+    const db = getDb();
+    if (!db) {
+      console.log("[Database] Skipped - in-memory mode");
+      return null;
+    }
+    return db;
+  } catch (e) {
+    console.log("[Database] Error getting DB, fallback to memory", e);
     return null;
   }
 }
 
-export async function getRecord(key: string): Promise<{
-  failedAttempts: number;
-  lockedUntil: Date | null;
-  isRepeatedOffender: boolean;
-} | null> {
-  const db = await dbOrNull();
+export async function addHistory(
+  ip: string,
+  fingerprint: string,
+  deviceId: string,
+  angle: number,
+  isCorrect: boolean,
+  ua: string,
+  parsedUA: any,
+  geo: any,
+  isVpn: boolean
+) {
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    ipAddress: ip || "unknown",
+    fingerprint: fingerprint || "unknown",
+    deviceId: deviceId || "unknown",
+    angle,
+    isCorrect: isCorrect ? 1 : 0,
+    country: geo?.country || "Unknown",
+    city: geo?.city || "Unknown",
+    zip: geo?.zip || "",
+    timezone: geo?.timezone || "",
+    isp: geo?.isp || "",
+    org: geo?.org || "",
+    as: geo?.as || "",
+    latitude: geo?.latitude || "",
+    longitude: geo?.longitude || "",
+    browserFamily: parsedUA?.browserFamily || parsedUA?.browser || "Unknown",
+    osFamily: parsedUA?.osFamily || parsedUA?.os || "Unknown",
+    deviceType: parsedUA?.deviceType || parsedUA?.device || "desktop",
+    userAgent: ua,
+    isVpn: isVpn ? 1 : 0,
+    createdAt: new Date(),
+  };
+
+  const db = dbOrNull();
   if (!db) {
-    const rec = memFallback.get(key);
-    return rec ? { failedAttempts: rec.failedAttempts, lockedUntil: rec.lockedUntil, isRepeatedOffender: rec.isRepeatedOffender } : null;
+    memHistory.unshift({ ...entry, createdAt: new Date(), timestamp: new Date() });
+    if (memHistory.length > 1000) memHistory.pop();
+    return;
   }
-  const rows = await db.select().from(lockKeys).where(eq(lockKeys.lockKey, key)).limit(1);
-  if (!rows.length) return null;
-  return { failedAttempts: rows[0].failedAttempts, lockedUntil: rows[0].lockedUntil, isRepeatedOffender: !!rows[0].isRepeatedOffender };
+
+  try {
+    await db.insert(attemptHistory).values(entry as any);
+  } catch (e) {
+    console.error("[DB] addHistory failed, fallback to memory", e);
+    memHistory.unshift({ ...entry, createdAt: new Date(), timestamp: new Date() });
+  }
 }
 
-async function getOrCreateRow(db: NonNullable<Awaited<ReturnType<typeof getDb>>>, key: string): Promise<LockKey> {
-  const existing = await db.select().from(lockKeys).where(eq(lockKeys.lockKey, key)).limit(1);
-  if (existing.length) return existing[0];
-  await db.insert(lockKeys).values({ lockKey: key, keyType: keyType(key) }).onDuplicateKeyUpdate({ set: { lastSeen: new Date() } });
-  const rows = await db.select().from(lockKeys).where(eq(lockKeys.lockKey, key)).limit(1);
-  return rows[0];
+export async function getAllHistory(limit = 100, offset = 0) {
+  const db = dbOrNull();
+  if (!db) return memHistory.slice(offset, offset + limit);
+  try {
+    const rows = await db
+      .select()
+      .from(attemptHistory)
+      .orderBy(desc(attemptHistory.createdAt))
+      .limit(limit)
+      .offset(offset);
+    return rows;
+  } catch (e) {
+    console.error("[DB] getAllHistory failed", e);
+    return memHistory.slice(offset, offset + limit);
+  }
 }
 
-export async function isLocked(key: string): Promise<boolean> {
-  const db = await dbOrNull();
+export async function getStats() {
+  const history = await getAllHistory(1000, 0);
+  const db = dbOrNull();
+  let lockedCount = 0;
+  let uniqueKeys = 0;
+
   if (!db) {
-    const rec = memFallback.get(key);
-    if (!rec?.lockedUntil) return false;
-    if (rec.lockedUntil.getTime() < Date.now()) { rec.failedAttempts = 0; rec.lockedUntil = null; return false; }
+    lockedCount = Array.from(memLocks.values()).filter(v => v.lockedUntil > Date.now()).length;
+    uniqueKeys = memLocks.size;
+  } else {
+    try {
+      const lockedRows = await db.select().from(lockKeys).where(sql`${lockKeys.lockedUntil} > NOW()`);
+      lockedCount = lockedRows.length;
+      const allRows = await db.select({ id: lockKeys.id }).from(lockKeys);
+      uniqueKeys = allRows.length;
+    } catch {}
+  }
+
+  const total = history.length;
+  const ok = history.filter((h: any) => h.isCorrect === 1).length;
+  const vpn = history.filter((h: any) => h.isVpn === 1).length;
+  return {
+    totalAttempts: total,
+    uniqueIps: uniqueKeys,
+    uniqueIPs: uniqueKeys,
+    successfulAttempts: ok,
+    failedAttempts: total - ok,
+    currentlyLockedIps: lockedCount,
+    lockedIPs: lockedCount,
+    successRate: total ? Math.round((ok / total) * 100) : 0,
+    repeatedOffenders: 0,
+    vpnAttempts: vpn,
+  };
+}
+
+export async function isLocked(key: string) {
+  if (!key) return false;
+  const db = dbOrNull();
+  if (!db) {
+    const rec = memLocks.get(key);
+    if (!rec) return false;
+    if (rec.lockedUntil < Date.now()) { memLocks.delete(key); return false; }
     return true;
   }
-  const rows = await db.select().from(lockKeys).where(eq(lockKeys.lockKey, key)).limit(1);
-  if (!rows.length || !rows[0].lockedUntil) return false;
-  if (rows[0].lockedUntil.getTime() < Date.now()) {
-    await db.update(lockKeys).set({ failedAttempts: 0, lockedUntil: null }).where(eq(lockKeys.lockKey, key));
-    return false;
-  }
-  return true;
-}
-
-export async function getRemainingLockoutTime(key: string): Promise<number> {
-  const db = await dbOrNull();
-  if (!db) {
-    const rec = memFallback.get(key);
-    if (!rec?.lockedUntil) return 0;
-    return Math.max(0, rec.lockedUntil.getTime() - Date.now());
-  }
-  const rows = await db.select().from(lockKeys).where(eq(lockKeys.lockKey, key)).limit(1);
-  if (!rows.length || !rows[0].lockedUntil) return 0;
-  return Math.max(0, rows[0].lockedUntil.getTime() - Date.now());
-}
-
-export async function recordFailedAttempt(
-  key: string,
-  ip: string,
-  fingerprint: string | undefined,
-  max: number,
-  lockoutMsFor: (isRepeatedOffender: boolean) => number
-): Promise<{ remainingAttempts: number; isLocked: boolean; lockedUntil: Date | null }> {
-  const db = await dbOrNull();
-  if (!db) {
-    let rec = memFallback.get(key);
-    if (!rec) { rec = { failedAttempts: 0, lockedUntil: null, totalAttempts: 0, successfulAttempts: 0, ips: new Set(), fingerprints: new Set(), isRepeatedOffender: false }; memFallback.set(key, rec); }
-    rec.failedAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
-    if (fingerprint) rec.fingerprints.add(fingerprint);
-    if (rec.ips.size > 1) rec.isRepeatedOffender = true;
-    let locked = false; let lockedUntil: Date | null = null;
-    if (rec.failedAttempts >= max) { locked = true; lockedUntil = new Date(Date.now() + lockoutMsFor(rec.isRepeatedOffender)); rec.lockedUntil = lockedUntil; }
-    return { remainingAttempts: Math.max(0, max - rec.failedAttempts), isLocked: locked, lockedUntil };
-  }
-
-  const row = await getOrCreateRow(db, key);
-  const ips = new Set(parseJsonArray(row.ipsJson)); ips.add(ip);
-  const fps = new Set(parseJsonArray(row.fingerprintsJson)); if (fingerprint) fps.add(fingerprint);
-  const isRepeatedOffender = ips.size > 1 || !!row.isRepeatedOffender;
-  const newFailed = row.failedAttempts + 1;
-  let lockedUntil: Date | null = null;
-  if (newFailed >= max) lockedUntil = new Date(Date.now() + lockoutMsFor(isRepeatedOffender));
-
-  await db.update(lockKeys).set({
-    failedAttempts: newFailed,
-    totalAttempts: row.totalAttempts + 1,
-    lastSeen: new Date(),
-    lockedUntil,
-    isRepeatedOffender: isRepeatedOffender ? 1 : 0,
-    ipsJson: JSON.stringify(Array.from(ips)),
-    fingerprintsJson: JSON.stringify(Array.from(fps)),
-  }).where(eq(lockKeys.lockKey, key));
-
-  return { remainingAttempts: Math.max(0, max - newFailed), isLocked: !!lockedUntil, lockedUntil };
-}
-
-export async function forceLock(key: string, ip: string, fingerprint: string | undefined, max: number, lockedUntil: Date) {
-  const db = await dbOrNull();
-  if (!db) {
-    let rec = memFallback.get(key);
-    if (!rec) { rec = { failedAttempts: 0, lockedUntil: null, totalAttempts: 0, successfulAttempts: 0, ips: new Set(), fingerprints: new Set(), isRepeatedOffender: false }; memFallback.set(key, rec); }
-    rec.failedAttempts = max; rec.lockedUntil = lockedUntil; rec.ips.add(ip); if (fingerprint) rec.fingerprints.add(fingerprint);
-    return;
-  }
-  const row = await getOrCreateRow(db, key);
-  const ips = new Set(parseJsonArray(row.ipsJson)); ips.add(ip);
-  const fps = new Set(parseJsonArray(row.fingerprintsJson)); if (fingerprint) fps.add(fingerprint);
-  await db.update(lockKeys).set({
-    failedAttempts: max,
-    lockedUntil,
-    lastSeen: new Date(),
-    ipsJson: JSON.stringify(Array.from(ips)),
-    fingerprintsJson: JSON.stringify(Array.from(fps)),
-  }).where(eq(lockKeys.lockKey, key));
-}
-
-export async function resetAttempts(keys: string[], ip: string, fingerprint?: string): Promise<void> {
-  const relevant = keys.filter(k => !k.startsWith("geo:") && !k.startsWith("asn:"));
-  const db = await dbOrNull();
-  if (!db) {
-    for (const k of relevant) {
-      let rec = memFallback.get(k);
-      if (!rec) { rec = { failedAttempts: 0, lockedUntil: null, totalAttempts: 0, successfulAttempts: 0, ips: new Set(), fingerprints: new Set(), isRepeatedOffender: false }; memFallback.set(k, rec); }
-      rec.failedAttempts = 0; rec.lockedUntil = null; rec.successfulAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
-      if (fingerprint) rec.fingerprints.add(fingerprint);
+  try {
+    const rows = await db.select().from(lockKeys).where(eq(lockKeys.id, key)).limit(1);
+    if (!rows.length) return false;
+    const until = new Date(rows[0].lockedUntil).getTime();
+    if (until < Date.now()) {
+      await db.delete(lockKeys).where(eq(lockKeys.id, key));
+      return false;
     }
-    return;
-  }
-  for (const k of relevant) {
-    const row = await getOrCreateRow(db, k);
-    const ips = new Set(parseJsonArray(row.ipsJson)); ips.add(ip);
-    const fps = new Set(parseJsonArray(row.fingerprintsJson)); if (fingerprint) fps.add(fingerprint);
-    await db.update(lockKeys).set({
-      failedAttempts: 0,
-      lockedUntil: null,
-      successfulAttempts: row.successfulAttempts + 1,
-      totalAttempts: row.totalAttempts + 1,
-      lastSeen: new Date(),
-      ipsJson: JSON.stringify(Array.from(ips)),
-      fingerprintsJson: JSON.stringify(Array.from(fps)),
-    }).where(eq(lockKeys.lockKey, k));
-  }
+    return true;
+  } catch { return false; }
 }
 
-export async function addHistory(entry: {
-  ip: string; fingerprint: string; deviceId: string; angle: number; isCorrect: boolean;
-  userAgent: string; parsed: any; geo: any; isVpn: boolean;
-}): Promise<void> {
-  const db = await dbOrNull();
-  if (!db) return; // brak DB = historia nie jest krytyczna dla bezpieczeństwa, pomijamy w fallbacku
-  await db.insert(attemptHistory).values({
-    ipAddress: entry.ip,
-    angle: String(entry.angle),
-    isCorrect: entry.isCorrect ? 1 : 0,
-    attemptNumber: 0,
-    userAgent: entry.userAgent,
-    country: entry.geo?.country || null,
-    city: entry.geo?.city || null,
-    latitude: entry.geo?.latitude || null,
-    longitude: entry.geo?.longitude || null,
-    isp: entry.geo?.isp || null,
-    org: entry.geo?.org || null,
-    as: entry.geo?.as || null,
-    timezone: entry.geo?.timezone || null,
-    zip: entry.geo?.zip || null,
-    browserFamily: entry.parsed?.browserFamily || entry.parsed?.browser || "Unknown",
-    osFamily: entry.parsed?.osFamily || entry.parsed?.os || "Unknown",
-    deviceType: entry.parsed?.deviceType || entry.parsed?.device || "desktop",
-    fingerprint: entry.fingerprint || "unknown",
-    deviceId: entry.deviceId || "unknown",
-    isVpn: entry.isVpn ? 1 : 0,
-  });
-}
-
-function subnetOf(ip: string): string | null {
-  if (!ip || ip === "unknown" || ip.startsWith("fallback")) return null;
-  if (ip.includes(":")) {
-    const parts = ip.split(":").filter(Boolean);
-    if (parts.length < 4) return null;
-    return `v6:${parts.slice(0, 4).join(":")}::/56`;
-  }
-  const p = ip.split(".");
-  if (p.length !== 4) return null;
-  return `${p[0]}.${p[1]}.${p[2]}.0/24`;
-}
-
-export async function getRecentLinkedKeys(fingerprint: string, deviceId: string, windowMs: number): Promise<string[]> {
-  const db = await dbOrNull();
-  const keys = new Set<string>();
-  const since = new Date(Date.now() - windowMs);
-  if (!db) return [];
-  if (!fingerprint && !deviceId) return [];
-  // Drizzle nie ma tu wygodnego "OR" bez importu `or`, robimy dwa zapytania i łączymy.
-  const rows: any[] = [];
-  if (fingerprint) rows.push(...await db.select().from(attemptHistory).where(eq(attemptHistory.fingerprint, fingerprint)).orderBy(desc(attemptHistory.createdAt)).limit(200));
-  if (deviceId) rows.push(...await db.select().from(attemptHistory).where(eq(attemptHistory.deviceId, deviceId)).orderBy(desc(attemptHistory.createdAt)).limit(200));
-
-  for (const h of rows) {
-    if (!h.createdAt || h.createdAt < since) continue;
-    if (h.ipAddress) { keys.add(h.ipAddress); const s = subnetOf(h.ipAddress); if (s) keys.add(s); }
-    if (h.city && h.city !== "Unknown") keys.add(`geo:${h.city}-${h.isp || h.org || "unknown"}`.slice(0, 80));
-  }
-  return Array.from(keys);
-}
-
-export async function getLockedAll(): Promise<Array<{ key: string; type: string; lockedUntil: Date; failedAttempts: number; isRepeatedOffender: boolean }>> {
-  const db = await dbOrNull();
+export async function getRemainingLockoutTime(key: string) {
+  if (!key) return 0;
+  const db = dbOrNull();
   if (!db) {
-    const out: any[] = [];
-    for (const [k, rec] of memFallback.entries()) {
-      if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) out.push({ key: k, type: keyType(k), lockedUntil: rec.lockedUntil, failedAttempts: rec.failedAttempts, isRepeatedOffender: rec.isRepeatedOffender });
+    const rec = memLocks.get(key);
+    if (!rec) return 0;
+    return Math.max(0, rec.lockedUntil - Date.now());
+  }
+  try {
+    const rows = await db.select().from(lockKeys).where(eq(lockKeys.id, key)).limit(1);
+    if (!rows.length) return 0;
+    return Math.max(0, new Date(rows[0].lockedUntil).getTime() - Date.now());
+  } catch { return 0; }
+}
+
+export async function recordFailedAttempt(key: string, ip: string, fingerprint?: string) {
+  const db = dbOrNull();
+  const lockedUntilDate = new Date(Date.now() + LOCKOUT_MS);
+
+  if (!db) {
+    const rec = memLocks.get(key) || { failed: 0, lockedUntil: 0 };
+    rec.failed += 1;
+    if (rec.failed >= MAX_ATTEMPTS) rec.lockedUntil = Date.now() + LOCKOUT_MS;
+    memLocks.set(key, rec);
+    return {
+      remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failed),
+      isLocked: rec.failed >= MAX_ATTEMPTS,
+      lockedUntil: rec.failed >= MAX_ATTEMPTS ? new Date(rec.lockedUntil) : null,
+    };
+  }
+
+  try {
+    const rows = await db.select().from(lockKeys).where(eq(lockKeys.id, key)).limit(1);
+    let failed = 1;
+    if (rows.length) failed = (rows[0].failedAttempts || 0) + 1;
+
+    if (failed >= MAX_ATTEMPTS) {
+      await db.insert(lockKeys).values({ id: key, lockedUntil: lockedUntilDate, failedAttempts: failed } as any)
+        .onDuplicateKeyUpdate({ set: { lockedUntil: lockedUntilDate, failedAttempts: failed } as any });
+      return { remainingAttempts: 0, isLocked: true, lockedUntil: lockedUntilDate };
+    } else {
+      await db.insert(lockKeys).values({ id: key, lockedUntil: new Date(Date.now() + 60*1000), failedAttempts: failed } as any)
+        .onDuplicateKeyUpdate({ set: { failedAttempts: failed, lockedUntil: new Date(Date.now() + 60*1000) } as any });
+      // od razu nadpisz na realną blokadę tylko gdy >= MAX, inaczej ustawiamy przyszłą datę ale isLocked=false, więc trzymamy licznik
+      // prościej: jeśli nie zablokowany, usuń blokadę ale zostaw licznik
+      if (failed < MAX_ATTEMPTS) {
+        // nie blokujemy jeszcze, ale licznik zostaje
+        return { remainingAttempts: Math.max(0, MAX_ATTEMPTS - failed), isLocked: false, lockedUntil: null };
+      }
+      return { remainingAttempts: 0, isLocked: true, lockedUntil: lockedUntilDate };
     }
-    return out;
+  } catch (e) {
+    console.error("[DB] recordFailedAttempt error", e);
+    return { remainingAttempts: 0, isLocked: true, lockedUntil: lockedUntilDate };
   }
-  const rows = await db.select().from(lockKeys).where(sql`${lockKeys.lockedUntil} > NOW()`);
-  return rows.map(r => ({ key: r.lockKey, type: r.keyType, lockedUntil: r.lockedUntil as Date, failedAttempts: r.failedAttempts, isRepeatedOffender: !!r.isRepeatedOffender }));
 }
 
-export async function deleteKeys(keys: Set<string>): Promise<number> {
-  const db = await dbOrNull();
-  if (!db) {
-    let c = 0;
-    for (const k of keys) if (memFallback.delete(k)) c++;
-    return c;
-  }
-  let c = 0;
+export async function resetAttempts(keys: string[]) {
+  const db = dbOrNull();
+  if (!db) { keys.forEach(k => memLocks.delete(k)); return; }
+  try {
+    for (const k of keys) await db.delete(lockKeys).where(eq(lockKeys.id, k));
+  } catch {}
+}
+
+export async function getLockedAll() {
+  const db = dbOrNull();
+  if (!db) return Array.from(memLocks.entries()).filter(([, v]) => v.lockedUntil > Date.now()).map(([k]) => k);
+  try {
+    const rows = await db.select({ id: lockKeys.id }).from(lockKeys).where(sql`${lockKeys.lockedUntil} > NOW()`);
+    return rows.map(r => r.id);
+  } catch { return []; }
+}
+
+export async function unlockKeys(keys: string[]) {
+  const db = dbOrNull();
+  if (!db) { keys.forEach(k => memLocks.delete(k)); return { deletedCount: keys.length }; }
+  let count = 0;
   for (const k of keys) {
-    await db.delete(lockKeys).where(eq(lockKeys.lockKey, k));
-    c += 1;
+    try { await db.delete(lockKeys).where(eq(lockKeys.id, k)); count++; } catch {}
   }
-  return c;
-}
-
-export async function findRelatedKeysFromHistory(seedKeys: string[]): Promise<Set<string>> {
-  const db = await dbOrNull();
-  const out = new Set<string>(seedKeys);
-  if (!db) return out;
-  for (const seed of seedKeys) {
-    const byIp = await db.select().from(attemptHistory).where(eq(attemptHistory.ipAddress, seed)).limit(200);
-    const byFp = await db.select().from(attemptHistory).where(eq(attemptHistory.fingerprint, seed)).limit(200);
-    const byDev = await db.select().from(attemptHistory).where(eq(attemptHistory.deviceId, seed)).limit(200);
-    for (const h of [...byIp, ...byFp, ...byDev]) {
-      if (h.ipAddress) { out.add(h.ipAddress); const s = subnetOf(h.ipAddress); if (s) out.add(s); }
-      if (h.fingerprint && h.fingerprint !== "unknown") out.add(h.fingerprint);
-      if (h.deviceId && h.deviceId !== "unknown") out.add(h.deviceId);
-      if (h.city && h.city !== "Unknown") out.add(`geo:${h.city}-${h.isp || h.org || "unknown"}`.slice(0, 80));
-    }
-  }
-  return out;
-}
-
-export async function getRecentByFingerprint(fingerprint: string, windowMs: number): Promise<Array<{ ipAddress: string; country: string | null }>> {
-  const db = await dbOrNull();
-  if (!db || !fingerprint) return [];
-  const since = new Date(Date.now() - windowMs);
-  const rows = await db.select().from(attemptHistory).where(eq(attemptHistory.fingerprint, fingerprint)).orderBy(desc(attemptHistory.createdAt)).limit(50);
-  return rows.filter(h => h.createdAt && h.createdAt >= since).map(h => ({ ipAddress: h.ipAddress, country: h.country }));
-}
-
-export async function getAllHistory(limit: number, offset: number) {
-  const db = await dbOrNull();
-  if (!db) return [];
-  return db.select().from(attemptHistory).orderBy(desc(attemptHistory.createdAt)).limit(limit).offset(offset);
-}
-
-export async function countLockedNow(): Promise<number> {
-  const db = await dbOrNull();
-  if (!db) {
-    let c = 0;
-    for (const rec of memFallback.values()) if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) c++;
-    return c;
-  }
-  const rows = await db.select().from(lockKeys).where(sql`${lockKeys.lockedUntil} > NOW()`);
-  return rows.length;
-}
-
-export async function countRepeatedOffenders(): Promise<number> {
-  const db = await dbOrNull();
-  if (!db) {
-    let c = 0;
-    for (const rec of memFallback.values()) if (rec.isRepeatedOffender) c++;
-    return c;
-  }
-  const rows = await db.select().from(lockKeys).where(eq(lockKeys.isRepeatedOffender, 1));
-  return rows.length;
-}
-
-export async function countDistinctKeys(): Promise<number> {
-  const db = await dbOrNull();
-  if (!db) return memFallback.size;
-  const rows = await db.select({ id: lockKeys.id }).from(lockKeys);
-  return rows.length;
+  return { deletedCount: count };
 }
