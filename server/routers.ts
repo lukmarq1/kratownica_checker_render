@@ -7,13 +7,13 @@ import { z } from "zod";
 import { parseUserAgent } from "./userAgentParser";
 import crypto from "crypto";
 
-// ULTIMATE ANTI-CHEAT: WiFi + 24h pamięć + INSTANT VPN BAN
+// ULTIMATE: WiFi + 24h pamięć VPN<->WiFi + INSTANT VPN BAN
 const MAX_ATTEMPTS = 2;
 const MAX_SUBNET_ATTEMPTS = 3;
 const MAX_GEO_ATTEMPTS = 4;
 const LOCKOUT_MS = 24 * 60 * 60 * 1000;
 const VPN_DETECTION_WINDOW_MS = 60 * 60 * 1000;
-const RECENT_LINK_WINDOW_MS = 24 * 60 * 60 * 1000; // 24h - łączy VPN <-> WiFi
+const RECENT_LINK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 interface AttemptRecord {
   failedAttempts: number;
@@ -39,7 +39,7 @@ const geoCache = new Map<string, any>();
 
 function getSubnet(ip: string): string | null {
   if (!ip || ip.includes(":") || ip.startsWith("fallback") || ip === "unknown") return null;
-  const p = ip.split("."); if (p.length !== 4) return null;
+  const p = ip.split("."); if (p.length!== 4) return null;
   return `${p[0]}.${p[1]}.${p[2]}.0/24`;
 }
 function getGeoKey(geo: any): string | null {
@@ -108,12 +108,12 @@ async function fetchGeo(ip: string) {
   } catch { return null; }
 }
 function detectVpnUsage(fp: string, curIp: string, curGeo: any): boolean {
-  if (!fp) return !!(curGeo?.isHosting||curGeo?.isProxy);
+  if (!fp) return!!(curGeo?.isHosting||curGeo?.isProxy);
   const recent = historyStore.filter(h=>h.fingerprint===fp && Date.now()-h.createdAt.getTime()<VPN_DETECTION_WINDOW_MS);
-  if (recent.length===0) return !!(curGeo?.isHosting||curGeo?.isProxy);
+  if (recent.length===0) return!!(curGeo?.isHosting||curGeo?.isProxy);
   const diffIp = recent.some(h=>h.ipAddress!==curIp);
   const diffCountry = curGeo && recent.some(h=>h.country!==curGeo.country);
-  return !!(diffIp||diffCountry||curGeo?.isHosting||curGeo?.isProxy);
+  return!!(diffIp||diffCountry||curGeo?.isHosting||curGeo?.isProxy);
 }
 function getRecentLinkedKeys(fingerprint: string, deviceId: string): string[] {
   const now = Date.now();
@@ -146,7 +146,7 @@ async function handleGetStatus(ctx:any, input:any){
   const subnet=getSubnet(ip); const geo=await fetchGeo(ip); const geoKey=getGeoKey(geo);
   const baseKeys=[fingerprint, deviceId, ip, subnet, geoKey].filter(Boolean) as string[];
   const linkedKeys=getRecentLinkedKeys(fingerprint, deviceId);
-  const keysToCheck=Array.from(new Set([...baseKeys, ...linkedKeys]));
+  const keysToCheck=Array.from(new Set([...baseKeys,...linkedKeys]));
   for(const k of keysToCheck){ if(await isLocked(k)){ return { isLocked:true, locked:true, remainingLockoutMs:await getRemainingLockoutTime(k), remainingMs:await getRemainingLockoutTime(k), blockedBy:k, remainingAttempts:0, attemptsLeft:0, maxAttempts:MAX_ATTEMPTS }; } }
   const primary=fingerprint||deviceId||ip; const rec=primary?attemptStore.get(primary):undefined; const failed=rec?.failedAttempts||0;
   const left=Math.max(0, MAX_ATTEMPTS - failed);
@@ -173,13 +173,13 @@ export const appRouter = router({
       const fingerprint=input.fingerprint||""; const subnet=getSubnet(ip);
       const ua=ctx.req.headers["user-agent"]||"unknown"; const parsed=parseUserAgent(ua); if(input.browser) parsed.browserFamily=input.browser as any;
       const geo=await fetchGeo(ip); const geoKey=getGeoKey(geo);
-      
-      // ===== INSTANT VPN / HOSTING / PROXY BAN - bez dawania 2 prób =====
-      const isInstantVpnBan = !!(geo?.isHosting || geo?.isProxy || geo?.isVpnFlag);
+
+      // INSTANT VPN BAN - zero prób dla VPN/Hosting/Proxy
+      const isInstantVpnBan =!!(geo?.isHosting || geo?.isProxy || geo?.isVpnFlag);
       if (isInstantVpnBan) {
         const banKeys = [fingerprint, deviceId, ip, subnet, geoKey].filter(Boolean) as string[];
         const linkedKeys = getRecentLinkedKeys(fingerprint, deviceId);
-        const allBanKeys = Array.from(new Set([...banKeys, ...linkedKeys]));
+        const allBanKeys = Array.from(new Set([...banKeys,...linkedKeys]));
         for (const k of allBanKeys) {
           const rec = getOrCreateRecord(k);
           rec.failedAttempts = getMaxForKey(k);
@@ -197,15 +197,14 @@ export const appRouter = router({
           remainingAttempts: 0,
           remaining: 0,
           remainingLockoutMs: LOCKOUT_MS,
-          blockedBy: geoKey || subnet || ip,
-          message: `🔒 Wykryto VPN/Proxy/Hosting (${geo?.isp||geo?.org||"VPN"}) - blokada 24h bez prób`
+          blockedBy: ip,
+          message: `VPN/Proxy/Hosting wykryty (${geo?.isp||geo?.org}) - blokada 24h`
         };
       }
-      // ===== KONIEC INSTANT BAN =====
 
       const baseKeys=[fingerprint,deviceId,ip,subnet,geoKey].filter(Boolean) as string[];
       const linkedKeys=getRecentLinkedKeys(fingerprint, deviceId);
-      const keysToCheck=Array.from(new Set([...baseKeys, ...linkedKeys]));
+      const keysToCheck=Array.from(new Set([...baseKeys,...linkedKeys]));
       for(const k of keysToCheck){ if(await isLocked(k)){ return {success:false,reason:"locked",remainingLockoutMs:await getRemainingLockoutTime(k),blockedBy:k}; } }
       const correctAngle=65; const tol=0.5; const isCorrect=input.angle>=correctAngle-tol && input.angle<=correctAngle+tol;
       const isVpn=detectVpnUsage(fingerprint,ip,geo);
