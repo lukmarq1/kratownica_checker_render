@@ -66,6 +66,9 @@ export const attemptHistory = mysqlTable("attempt_history", {
   browserFamily: varchar("browserFamily", { length: 50 }),
   osFamily: varchar("osFamily", { length: 50 }),
   deviceType: varchar("deviceType", { length: 50 }),
+  fingerprint: varchar("fingerprint", { length: 191 }),
+  deviceId: varchar("deviceId", { length: 191 }),
+  isVpn: int("isVpn").notNull().default(0),
   createdAt: timestamp("createdAt").defaultNow().notNull(),
 });
 
@@ -96,3 +99,28 @@ export const userDeviceProfiles = mysqlTable("user_device_profiles", {
 
 export type UserDeviceProfile = typeof userDeviceProfiles.$inferSelect;
 export type InsertUserDeviceProfile = typeof userDeviceProfiles.$inferInsert;
+
+/**
+ * Trwały (przetrwa restart / działa na wielu instancjach) magazyn blokad.
+ * Jeden wiersz na "klucz" (fingerprint / deviceId / IP / subnet / geo / ASN).
+ * To zastępuje dawny in-memory `attemptStore` z routers.ts.
+ */
+export const lockKeys = mysqlTable("lock_keys", {
+  id: int("id").autoincrement().primaryKey(),
+  lockKey: varchar("lockKey", { length: 191 }).notNull().unique(),
+  keyType: varchar("keyType", { length: 20 }).notNull(), // fingerprint | device | ip | subnet | geo | asn
+  failedAttempts: int("failedAttempts").notNull().default(0),
+  lockedUntil: timestamp("lockedUntil"),
+  firstSeen: timestamp("firstSeen").defaultNow().notNull(),
+  lastSeen: timestamp("lastSeen").defaultNow().notNull(),
+  totalAttempts: int("totalAttempts").notNull().default(0),
+  successfulAttempts: int("successfulAttempts").notNull().default(0),
+  isRepeatedOffender: int("isRepeatedOffender").notNull().default(0),
+  ipsJson: text("ipsJson"),
+  fingerprintsJson: text("fingerprintsJson"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
+});
+
+export type LockKey = typeof lockKeys.$inferSelect;
+export type InsertLockKey = typeof lockKeys.$inferInsert;

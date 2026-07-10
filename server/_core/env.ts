@@ -5,6 +5,10 @@ export const ENV = {
   oAuthServerUrl: process.env.OAUTH_SERVER_URL ?? "",
   ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
   adminPin: process.env.ADMIN_PIN ?? "",
+  // Liczba WŁASNYCH proxy przed appką (Render/Cloudflare/nginx), których
+  // wpisom w X-Forwarded-For ufamy. Ustaw poprawnie albo IP klienta da się
+  // podszyć nagłówkiem wysłanym przez atakującego.
+  trustedProxyHops: Number(process.env.TRUSTED_PROXY_HOPS ?? "1"),
   isProduction: process.env.NODE_ENV === "production",
   forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
   forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
