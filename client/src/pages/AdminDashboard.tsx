@@ -180,6 +180,15 @@ export default function AdminDashboard() {
   const attempts = (attemptsQ.data as any[]) || [];
   const lockedIPs = (lockedQ.data as string[]) || [];
   const groups = useGroupedBlocks(attempts, lockedIPs);
+  const utils = trpc.useUtils();
+  const clearLogsMutation = trpc.admin.clearLogs.useMutation({
+    onSuccess: () => {
+      utils.admin.getAttempts.invalidate();
+      utils.admin.getStats.invalidate();
+      // @ts-ignore
+      utils.admin.getAdvancedAnalytics?.invalidate?.();
+    },
+  });
 
   useEffect(()=>{ try { localStorage.setItem("admin_view_mode", viewMode); } catch {} }, [viewMode]);
 
@@ -239,7 +248,23 @@ export default function AdminDashboard() {
 
         <Card className="bg-slate-800 border-slate-700">
           <div className="p-6">
-            <div className="flex items-center gap-2 mb-6"><MapPin className="w-5 h-5 text-cyan-400" /><h2 className="text-lg font-bold text-white font-mono">Historia prób</h2><span className="text-xs text-slate-500 font-mono ml-2">Kliknij w lokalizację aby otworzyć szczegóły</span></div>
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-6">
+              <div className="flex items-center gap-2"><MapPin className="w-5 h-5 text-cyan-400" /><h2 className="text-lg font-bold text-white font-mono">Historia prób</h2><span className="text-xs text-slate-500 font-mono ml-2">Kliknij w lokalizację aby otworzyć szczegóły</span></div>
+              <Button
+                onClick={() => {
+                  if (confirm(`Na pewno wyczyścić całą historię?\nUsunięte zostanie ${attempts.length} wpisów.\nTej operacji nie da się cofnąć.`)) {
+                    clearLogsMutation.mutate()
+                  }
+                }}
+                disabled={clearLogsMutation.isPending || attempts.length === 0}
+                variant="outline"
+                size="sm"
+                className="border-red-900/60 text-red-300 hover:bg-red-950/60 hover:text-red-200 hover:border-red-800 font-mono text-xs gap-1.5"
+              >
+                <X className="w-3.5 h-3.5" />
+                {clearLogsMutation.isPending ? "Czyszczenie..." : `Wyczyść logi (${attempts.length})`}
+              </Button>
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm font-mono">
                 <thead><tr className="border-b-2 border-slate-600"><th className="text-left py-3 px-3 text-slate-400">IP</th><th className="text-left py-3 px-3 text-slate-400">Kąt</th><th className="text-left py-3 px-3 text-slate-400">Status</th><th className="text-left py-3 px-3 text-slate-400">Urządzenie</th><th className="text-left py-3 px-3 text-slate-400">Lokalizacja</th><th className="text-left py-3 px-3 text-slate-400">Czas</th><th className="text-left py-3 px-3 text-slate-400">Akcja</th></tr></thead>
