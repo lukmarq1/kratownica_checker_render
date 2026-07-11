@@ -138,14 +138,14 @@ export const appRouter = router({
     status: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
       const ip = getClientIp(ctx.req); let deviceId = input.deviceId || getDeviceId(ctx.req); const fingerprint = input.fingerprint || "";
       const primaryKey = fingerprint || deviceId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
-      for (const k of keysToCheck) { if (await isLocked(k)) { const ms = await getRemainingLockoutTime(k); return { isLocked: true, locked: true, remainingLockoutMs: ms, remainingMs: ms }; } }
+      for (const k of keysToCheck) { if (await isLocked(k)) { const ms = await getRemainingLockoutTime(k); return { isLocked: true, locked: true, remainingAttempts: 0, attemptsLeft: 0, remainingLockoutMs: ms, remainingMs: ms }; } }
       const rec = attemptStore.get(primaryKey); const attemptsLeft = rec? Math.max(0, MAX_ATTEMPTS - rec.failedAttempts) : MAX_ATTEMPTS;
       return { isLocked: false, locked: false, remainingAttempts: attemptsLeft, attemptsLeft, remainingLockoutMs: 0, remainingMs: 0, maxAttempts: MAX_ATTEMPTS };
     }),
     getStatus: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
       const ip = getClientIp(ctx.req); let deviceId = input.deviceId || getDeviceId(ctx.req); const fingerprint = input.fingerprint || "";
       const primaryKey = fingerprint || deviceId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, deviceId, fingerprint].filter(Boolean))) as string[];
-      for (const k of keysToCheck) { if (await isLocked(k)) { const ms = await getRemainingLockoutTime(k); return { isLocked: true, locked: true, remainingLockoutMs: ms, remainingMs: ms }; } }
+      for (const k of keysToCheck) { if (await isLocked(k)) { const ms = await getRemainingLockoutTime(k); return { isLocked: true, locked: true, remainingAttempts: 0, attemptsLeft: 0, remainingLockoutMs: ms, remainingMs: ms }; } }
       const rec = attemptStore.get(primaryKey); const attemptsLeft = rec? Math.max(0, MAX_ATTEMPTS - rec.failedAttempts) : MAX_ATTEMPTS;
       return { isLocked: false, locked: false, remainingAttempts: attemptsLeft, attemptsLeft, remainingLockoutMs: 0, remainingMs: 0, maxAttempts: MAX_ATTEMPTS };
     }),
