@@ -26,7 +26,8 @@ export const attemptHistory = mysqlTable("attempt_history", {
 
 export const lockKeys = mysqlTable("lock_keys", {
   id: varchar("id", { length: 191 }).primaryKey(),
-  lockedUntil: datetime("lockedUntil", { mode: "date" }).notNull(),
+  // NULL = nie zablokowany, data w przyszłości = zablokowany do
+  lockedUntil: datetime("lockedUntil", { mode: "date" }),
   failedAttempts: int("failedAttempts").notNull().default(0),
   createdAt: datetime("createdAt", { mode: "date" }).notNull().$defaultFn(() => new Date()),
   updatedAt: datetime("updatedAt", { mode: "date" }).notNull().$defaultFn(() => new Date()).$onUpdateFn(() => new Date()),
