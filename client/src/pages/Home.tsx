@@ -96,7 +96,7 @@ export default function Home() {
       } else {
         setResult({
           success: false,
-          message: `❌ Niepoprawny kąt. Pozostało prób: ${data.remainingAttempts}`,
+          message: `❌ Niepoprawny kąt.`,
           remainingAttempts: data.remainingAttempts,
         });
         statusQuery.refetch();
