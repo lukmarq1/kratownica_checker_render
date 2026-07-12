@@ -1,246 +1,172 @@
-import { COOKIE_NAME } from "@shared/const";
-import { getSessionCookieOptions } from "./_core/cookies";
-import { ENV } from "./_core/env";
-import { systemRouter } from "./_core/systemRouter";
-import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
-import { parseUserAgent } from "./userAgentParser";
+import { publicProcedure, router } from "./_core/trpc";
+import mysql from "mysql2/promise";
 import crypto from "crypto";
 
 const MAX_ATTEMPTS = 2;
-const LOCKOUT_MS = 30 * 24 * 60 * 60 * 1000; // 30 dni
-const VPN_DETECTION_WINDOW_MS = 60 * 60 * 1000;
+const BASE_LOCKOUT_MS = 24 * 60 * 60 * 1000; // 1 dzień - pierwsza kara
+const REPEAT_LOCKOUT_MS = 3 * 24 * 60 * 60 * 1000; // 3 dni - recydywa / VPN / zmiana sieci
+const COOKIE_NAME = "__Host-kratownica_did";
+const CORRECT_ANGLE = 65;
+const TOLERANCE = 2;
+const ADMIN_PIN = process.env.ADMIN_PIN || "1234";
 
-interface AttemptRecord {
-  failedAttempts: number;
-  lockedUntil: Date | null;
-  firstSeen: Date;
-  lastSeen: Date;
-  totalAttempts: number;
-  successfulAttempts: number;
-  ips: Set<string>;
-  fingerprints: Set<string>;
-  isRepeatedOffender: boolean;
+let pool: mysql.Pool | null = null;
+function getPool() {
+  if (pool) return pool;
+  const raw = process.env.DATABASE_URL;
+  if (!raw) throw new Error("Brak DATABASE_URL");
+  const u = new URL(raw);
+  pool = mysql.createPool({
+    host: u.hostname, port: Number(u.port || 3306),
+    user: decodeURIComponent(u.username), password: decodeURIComponent(u.password),
+    database: u.pathname.replace(/^\//, "") || "defaultdb",
+    ssl: { rejectUnauthorized: false } as any, waitForConnections: true, connectionLimit: 5,
+  });
+  return pool;
 }
-
-interface HistoryEntry {
-  id: string;
-  ipAddress: string;
-  fingerprint: string;
-  deviceId: string;
-  angle: number;
-  isCorrect: number;
-  country: string;
-  city: string;
-  zip: string;
-  timezone: string;
-  isp: string;
-  org: string;
-  as: string;
-  latitude: string;
-  longitude: string;
-  browserFamily: string;
-  osFamily: string;
-  deviceType: string;
-  createdAt: Date;
-  timestamp: Date;
-  userAgent: string;
-  isVpn: boolean;
-}
-
-const attemptStore = new Map<string, AttemptRecord>();
-const historyStore: HistoryEntry[] = [];
-const geoCache = new Map<string, any>();
-
-// === BLOKADA ZAKRESU IP /24 ===
-function isIPv4(ip: string){ return /^\d+\.\d+\.\d+\.\d+$/.test(ip); }
-function getSubnet(ip: string){ if(!isIPv4(ip)) return ip; return ip.split(".").slice(0,3).join("."); }
-function getSubnetKey(ip: string){ return `subnet:${getSubnet(ip)}`; }
-
-function getOrCreateRecord(key: string) {
-  let rec = attemptStore.get(key);
-  if (!rec) {
-    rec = { failedAttempts: 0, lockedUntil: null, firstSeen: new Date(), lastSeen: new Date(), totalAttempts: 0, successfulAttempts: 0, ips: new Set(), fingerprints: new Set(), isRepeatedOffender: false };
-    attemptStore.set(key, rec);
-  }
-  if (rec.lockedUntil && rec.lockedUntil.getTime() < Date.now()) { rec.failedAttempts = 0; rec.lockedUntil = null; }
-  rec.lastSeen = new Date();
-  return rec;
-}
-async function isLocked(key: string) {
-  const rec = attemptStore.get(key);
-  if (!rec?.lockedUntil) return false;
-  if (rec.lockedUntil.getTime() < Date.now()) { rec.failedAttempts = 0; rec.lockedUntil = null; return false; }
-  return true;
-}
-async function getRemainingLockoutTime(key: string) {
-  const rec = attemptStore.get(key);
-  if (!rec?.lockedUntil) return 0;
-  return Math.max(0, rec.lockedUntil.getTime() - Date.now());
-}
-async function recordFailedAttempt(key: string, ip: string, fingerprint?: string) {
-  const rec = getOrCreateRecord(key);
-  rec.failedAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
-  if (fingerprint) rec.fingerprints.add(fingerprint);
-  if (rec.ips.size > 1) rec.isRepeatedOffender = true;
-  let isLockedNow = false; let lockedUntil: Date | null = null;
-  if (rec.failedAttempts >= MAX_ATTEMPTS) { isLockedNow = true; lockedUntil = new Date(Date.now() + LOCKOUT_MS); rec.lockedUntil = lockedUntil; }
-  return { remainingAttempts: Math.max(0, MAX_ATTEMPTS - rec.failedAttempts), isLocked: isLockedNow, lockedUntil };
-}
-async function resetAttempts(keys: string[], ip: string, fingerprint?: string) {
-  for (const key of keys) {
-    const rec = getOrCreateRecord(key);
-    rec.failedAttempts = 0; rec.lockedUntil = null; rec.successfulAttempts += 1; rec.totalAttempts += 1; rec.ips.add(ip);
-    if (fingerprint) rec.fingerprints.add(fingerprint);
-  }
-}
-async function fetchGeo(ip: string) {
-  if (ip.startsWith("fallback") || ip === "unknown" || ip.startsWith("192.168") || ip.startsWith("127.") || ip.startsWith("10.")) return null;
-  if (geoCache.has(ip)) return geoCache.get(ip);
-  try {
-    const controller = new AbortController(); const t = setTimeout(() => controller.abort(), 2000);
-    const res = await fetch(`https://ipwho.is/${ip}`, { signal: controller.signal } as any); clearTimeout(t);
-    if (!res.ok) return null; const d = await res.json(); if (!d.success) return null;
-    const g = { country: d.country || "Unknown", city: d.city || "Unknown", zip: d.postal || "", timezone: d.timezone?.id || "", isp: d.connection?.isp || "", org: d.connection?.org || "", as: d.connection?.asn? `AS${d.connection.asn} ${d.connection?.org || ""}` : "", latitude: String(d.latitude || ""), longitude: String(d.longitude || ""), isHosting: d.connection?.hosting || false, isProxy: d.security?.is_proxy || d.security?.is_vpn || false };
-    geoCache.set(ip, g); return g;
-  } catch { return null; }
-}
-function detectVpnUsage(fingerprint: string, currentIp: string, currentGeo: any): boolean {
-  if (!fingerprint) return false;
-  const recent = historyStore.filter(h => h.fingerprint === fingerprint && Date.now() - h.createdAt.getTime() < VPN_DETECTION_WINDOW_MS);
-  if (recent.length === 0) return false;
-  const differentIp = recent.some(h => h.ipAddress!== currentIp);
-  const differentCountry = currentGeo && recent.some(h => h.country!== currentGeo.country);
-  return differentIp || differentCountry || currentGeo?.isHosting || currentGeo?.isProxy;
-}
-async function addHistory(ip: string, fingerprint: string, deviceId: string, angle: number, correct: boolean, ua: string, parsedUA: any, geo: any, isVpn: boolean) {
-  const now = new Date();
-  const entry: HistoryEntry = { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, ipAddress: ip, fingerprint: fingerprint || "unknown", deviceId: deviceId || "unknown", angle, isCorrect: correct? 1 : 0, country: geo?.country || "Unknown", city: geo?.city || "Unknown", zip: geo?.zip || "", timezone: geo?.timezone || "", isp: geo?.isp || "", org: geo?.org || "", as: geo?.as || "", latitude: geo?.latitude || "", longitude: geo?.longitude || "", browserFamily: parsedUA?.browserFamily || parsedUA?.browser || "Unknown", osFamily: parsedUA?.osFamily || parsedUA?.os || "Unknown", deviceType: parsedUA?.deviceType || parsedUA?.device || "desktop", createdAt: now, timestamp: now, userAgent: ua, isVpn };
-  historyStore.unshift(entry); if (historyStore.length > 1000) historyStore.pop();
+async function ensureTable() {
+  const p = getPool();
+  // MAX przechowywanie - tabele bez limitu, indeksy dla szybkości
+  await p.query(`CREATE TABLE IF NOT EXISTS lockouts (lock_key VARCHAR(255) PRIMARY KEY, failed_attempts INT NOT NULL DEFAULT 0, locked_until DATETIME NULL, last_attempt_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, is_subnet TINYINT(1) DEFAULT 0, total_locks INT NOT NULL DEFAULT 0, total_attempts INT NOT NULL DEFAULT 0, ips_json TEXT NULL, INDEX idx_locked_until (locked_until))`);
+  await p.query(`CREATE TABLE IF NOT EXISTS device_networks (fingerprint VARCHAR(255) PRIMARY KEY, first_ip VARCHAR(45) NOT NULL, first_subnet VARCHAR(45) NOT NULL, last_ip VARCHAR(45) NOT NULL, last_subnet VARCHAR(45) NOT NULL, updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)`);
+  await p.query(`CREATE TABLE IF NOT EXISTS attempt_logs (id INT AUTO_INCREMENT PRIMARY KEY, ip VARCHAR(45), subnet VARCHAR(45), angle INT, status ENUM('success','fail','locked','vpn') DEFAULT 'fail', browser VARCHAR(100), fingerprint VARCHAR(255), device_id VARCHAR(255), localization VARCHAR(100), created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, INDEX idx_created (created_at), INDEX idx_ip (ip), INDEX idx_fp (fingerprint))`);
+  // migracja dla istniejącej bazy - nie kasuje danych, tylko dodaje kolumny
+  try { await p.query(`ALTER TABLE lockouts ADD COLUMN total_locks INT NOT NULL DEFAULT 0`); } catch {}
+  try { await p.query(`ALTER TABLE lockouts ADD COLUMN total_attempts INT NOT NULL DEFAULT 0`); } catch {}
+  try { await p.query(`ALTER TABLE lockouts ADD COLUMN ips_json TEXT NULL`); } catch {}
 }
 function getClientIp(req: any): string {
-  const xff = req.headers["x-forwarded-for"]; let ip = "unknown";
-  if (xff) { const ips = Array.isArray(xff)? xff : xff.split(","); const first = (ips[0] || "").trim(); if (first && first!== "unknown") ip = first; }
-  if (ip === "unknown" && req.ip && req.ip!== "unknown") ip = req.ip;
-  if (ip === "unknown") { const ua = req.headers["user-agent"] || ""; ip = `fallback-${Buffer.from(ua).toString("base64").slice(0, 8)}`; }
-  return ip;
+  const h = req.headers || {};
+  const candidates = [h["x-forwarded-for"], h["x-real-ip"], h["cf-connecting-ip"], h["x-client-ip"], h["true-client-ip"]];
+  for (const c of candidates) { if (typeof c === "string" && c.length) return c.split(",")[0].trim(); if (Array.isArray(c) && c.length) return c[0].split(",")[0].trim(); }
+  return req.ip || req.socket?.remoteAddress || req.connection?.remoteAddress || "0.0.0.0";
 }
-function getDeviceId(req: any): string {
-  const cookies = req.headers.cookie || ""; const match = cookies.match(/device_id=([^;]+)/); return match? match[1] : "";
+function isIPv4(ip: string) { return /^\d+\.\d+\.\d+\.\d+$/.test(ip); }
+function getSubnet(ip: string) { if (!isIPv4(ip)) return ip; return ip.split(".").slice(0, 3).join("."); }
+function getSubnetKey(ip: string) { return `subnet:${getSubnet(ip)}`; }
+function parseCookies(req: any): Record<string, string> { const h = req.headers?.cookie || ""; const out: Record<string, string> = {}; h.split(";").forEach((p: string) => { const [k,...v] = p.trim().split("="); if (k) out[k] = decodeURIComponent(v.join("=")); }); return out; }
+function ensureDoubleCookie(ctx: any, inputDeviceId?: string) {
+  const cookies = parseCookies(ctx.req); let cookieId = cookies[COOKIE_NAME]; let deviceId = inputDeviceId || (ctx.req.headers?.["x-device-id"] as string) || cookieId;
+  if (!cookieId) { cookieId = deviceId || crypto.randomUUID(); try { ctx.res?.setHeader?.("Set-Cookie", `${COOKIE_NAME}=${cookieId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${60*60*24*365}`); } catch {} }
+  if (!deviceId) deviceId = cookieId; return { deviceId: deviceId!, cookieId: cookieId! };
+}
+async function getRecord(key: string) { await ensureTable(); const [rows] = await getPool().query<any[]>(`SELECT * FROM lockouts WHERE lock_key =?`, [key]); return (rows as any[])[0] || null; }
+async function isLocked(key: string) { const rec = await getRecord(key); if (!rec?.locked_until) return false; return new Date(rec.locked_until).getTime() > Date.now(); }
+async function getRemaining(key: string) { const rec = await getRecord(key); if (!rec?.locked_until) return 0; return Math.max(0, new Date(rec.locked_until).getTime() - Date.now()); }
+
+// NOWE: wylicz czy recydywa -> 3 dni
+async function getRepeatDuration(keys: string[], fingerprint: string, ip: string): Promise<number> {
+  const p = getPool();
+  // 1) czy którykolwiek klucz już był blokowany?
+  for (const k of keys) {
+    const r = await getRecord(k);
+    if (r && (r.total_locks > 0 || r.total_attempts >= 4)) return REPEAT_LOCKOUT_MS;
+  }
+  // 2) czy zmieniał IP / subnet? (VPN / telefon)
+  if (fingerprint) {
+    try {
+      const [rows] = await p.query<any[]>(`SELECT first_ip, last_ip, first_subnet, last_subnet FROM device_networks WHERE fingerprint=?`, [fingerprint]);
+      const dn = (rows as any[])[0];
+      if (dn && (dn.first_ip !== dn.last_ip || dn.first_subnet !== dn.last_subnet)) return REPEAT_LOCKOUT_MS;
+      // 3) czy w historii ma >=2 faili? (kombinował w przeszłości)
+      const [logs] = await p.query<any[]>(`SELECT COUNT(*) as c FROM attempt_logs WHERE fingerprint=? AND status IN ('fail','locked','vpn')`, [fingerprint]);
+      if ((logs as any[])[0]?.c >= 2) return REPEAT_LOCKOUT_MS;
+    } catch {}
+  }
+  // 4) czy to IP ma już różne fingerprinty? (ten sam IP, różne przeglądarki = obchodzenie)
+  try {
+    const subnet = getSubnet(ip);
+    const [srows] = await p.query<any[]>(`SELECT COUNT(DISTINCT fingerprint) as c FROM attempt_logs WHERE subnet=? AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)`, [subnet]);
+    if ((srows as any[])[0]?.c >= 3) return REPEAT_LOCKOUT_MS;
+  } catch {}
+  return BASE_LOCKOUT_MS;
 }
 
-export const appRouter = router({
-  system: systemRouter,
-  auth: router({
-    me: publicProcedure.query(async ({ ctx }) => { return (ctx as any).user || null; }),
-    logout: publicProcedure.mutation(async ({ ctx }) => {
-      const cookieOptions = getSessionCookieOptions((ctx.req as any));
-      if ((ctx.res as any).clearCookie) (ctx.res as any).clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
-      return { success: true } as const;
-    }),
+async function lockKeys(keys: string[], fingerprint?: string, ip?: string) {
+  if (!keys.length) return BASE_LOCKOUT_MS; await ensureTable(); const p = getPool();
+  const duration = await getRepeatDuration(keys, fingerprint || "", ip || "");
+  const until = new Date(Date.now() + duration);
+  for (const k of keys) {
+    await p.query(`INSERT INTO lockouts (lock_key, failed_attempts, locked_until, last_attempt_at, is_subnet, total_locks, total_attempts) VALUES (?,?,?,NOW(),?,1,?) ON DUPLICATE KEY UPDATE failed_attempts=VALUES(failed_attempts), locked_until=VALUES(locked_until), last_attempt_at=NOW(), total_locks = total_locks + 1, total_attempts = total_attempts + 1`, [k, MAX_ATTEMPTS, until, k.startsWith("subnet:")?1:0, MAX_ATTEMPTS]);
+  }
+  return duration;
+}
+async function incrementFail(keys: string[], fingerprint?: string, ip?: string) {
+  if (!keys.length) return { locked: false, duration: BASE_LOCKOUT_MS }; await ensureTable(); const p = getPool(); let shouldLock = false;
+  for (const k of keys) { const rec = await getRecord(k); const fails = (rec?.failed_attempts||0)+1; if (fails >= MAX_ATTEMPTS) shouldLock = true; }
+  if (shouldLock) { const dur = await lockKeys(keys, fingerprint, ip); return { locked: true, duration: dur }; }
+  for (const k of keys) { const rec = await getRecord(k); const fails = (rec?.failed_attempts||0)+1; await p.query(`INSERT INTO lockouts (lock_key, failed_attempts, last_attempt_at, total_attempts) VALUES (?,?,NOW(),1) ON DUPLICATE KEY UPDATE failed_attempts=?, last_attempt_at=NOW(), total_attempts = total_attempts + 1`, [k, fails, fails]); }
+  return { locked: false, duration: BASE_LOCKOUT_MS };
+}
+async function clearLock(keys: string[]) { if (!keys.length) return; await ensureTable(); const p = getPool(); const placeholders = keys.map(() => "?").join(","); await p.query(`DELETE FROM lockouts WHERE lock_key IN (${placeholders})`, keys); }
+async function logAttempt(data: { ip: string, angle: number, status: 'success'|'fail'|'locked'|'vpn', browser?: string, fingerprint?: string, deviceId?: string }) {
+  try { await ensureTable(); const p = getPool(); const subnet = getSubnet(data.ip); await p.query(`INSERT INTO attempt_logs (ip, subnet, angle, status, browser, fingerprint, device_id, localization) VALUES (?,?,?,?,?,?,?,?)`, [data.ip, subnet, data.angle, data.status, data.browser||null, data.fingerprint||null, data.deviceId||null, subnet]); } catch(e){ console.error("logAttempt error", e); }
+}
+async function checkVpnAndUpdate(fingerprint: string, ip: string) {
+  if (!fingerprint || fingerprint === "fp-fallback") return { isVpn: false }; await ensureTable(); const p = getPool(); const subnet = getSubnet(ip);
+  const [rows] = await p.query<any[]>(`SELECT * FROM device_networks WHERE fingerprint =?`, [fingerprint]); const existing = (rows as any[])[0];
+  if (!existing) { await p.query(`INSERT INTO device_networks (fingerprint, first_ip, first_subnet, last_ip, last_subnet) VALUES (?,?,?,?,?)`, [fingerprint, ip, subnet, ip, subnet]); return { isVpn: false }; }
+  const changed = existing.last_ip !== ip || existing.last_subnet !== subnet;
+  await p.query(`UPDATE device_networks SET last_ip=?, last_subnet=? WHERE fingerprint=?`, [ip, subnet, fingerprint]);
+  return { isVpn: changed && existing.first_subnet !== subnet, isRepeat: true };
+}
+
+export const angleRouter = router({
+  status: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
+    const ip = getClientIp(ctx.req); const { deviceId, cookieId } = ensureDoubleCookie(ctx, input.deviceId); const fingerprint = input.fingerprint || ""; const subnetKey = getSubnetKey(ip);
+    const primaryKey = fingerprint || deviceId || cookieId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, subnetKey, deviceId, cookieId, fingerprint].filter(Boolean))) as string[];
+    for (const k of keysToCheck) { if (await isLocked(k)) { return { isLocked: true, locked: true, remainingAttempts: 0, attemptsLeft: 0, remainingLockoutMs: await getRemaining(k), remainingMs: await getRemaining(k) }; } }
+    const rec = await getRecord(primaryKey); const left = rec? Math.max(0, MAX_ATTEMPTS - rec.failed_attempts) : MAX_ATTEMPTS;
+    return { isLocked: false, locked: false, remainingAttempts: left, attemptsLeft: left, remainingLockoutMs: 0, remainingMs: 0, maxAttempts: MAX_ATTEMPTS };
   }),
-  angle: router({
-    status: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
-      const ip = getClientIp(ctx.req); let deviceId = input.deviceId || getDeviceId(ctx.req); const fingerprint = input.fingerprint || "";
-      const subnetKey = getSubnetKey(ip);
-      const primaryKey = fingerprint || deviceId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, subnetKey, deviceId, fingerprint].filter(Boolean))) as string[];
-      for (const k of keysToCheck) { if (await isLocked(k)) { const ms = await getRemainingLockoutTime(k); return { isLocked: true, locked: true, remainingAttempts: 0, attemptsLeft: 0, remainingLockoutMs: ms, remainingMs: ms }; } }
-      const rec = attemptStore.get(primaryKey); const attemptsLeft = rec? Math.max(0, MAX_ATTEMPTS - rec.failedAttempts) : MAX_ATTEMPTS;
-      return { isLocked: false, locked: false, remainingAttempts: attemptsLeft, attemptsLeft, remainingLockoutMs: 0, remainingMs: 0, maxAttempts: MAX_ATTEMPTS };
-    }),
-    getStatus: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
-      const ip = getClientIp(ctx.req); let deviceId = input.deviceId || getDeviceId(ctx.req); const fingerprint = input.fingerprint || "";
-      const subnetKey = getSubnetKey(ip);
-      const primaryKey = fingerprint || deviceId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, subnetKey, deviceId, fingerprint].filter(Boolean))) as string[];
-      for (const k of keysToCheck) { if (await isLocked(k)) { const ms = await getRemainingLockoutTime(k); return { isLocked: true, locked: true, remainingAttempts: 0, attemptsLeft: 0, remainingLockoutMs: ms, remainingMs: ms }; } }
-      const rec = attemptStore.get(primaryKey); const attemptsLeft = rec? Math.max(0, MAX_ATTEMPTS - rec.failedAttempts) : MAX_ATTEMPTS;
-      return { isLocked: false, locked: false, remainingAttempts: attemptsLeft, attemptsLeft, remainingLockoutMs: 0, remainingMs: 0, maxAttempts: MAX_ATTEMPTS };
-    }),
-    verify: publicProcedure.input(z.object({ angle: z.number(), fingerprint: z.string().optional(), deviceId: z.string().optional(), browser: z.string().optional(), os: z.string().optional() })).mutation(async ({ ctx, input }) => {
-      (ctx as any).user = { id: 1, openId: "public-user", name: "Gość", email: "guest@example.com", loginMethod: "public", role: "user", createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date() } as any;
-      const ip = getClientIp(ctx.req); let deviceId = getDeviceId(ctx.req);
-      if (!deviceId) { deviceId = crypto.randomUUID(); if ((ctx.res as any).cookie) (ctx.res as any).cookie('device_id', deviceId, { maxAge: 365*24*60*60*1000, httpOnly: true, sameSite: 'lax', path: '/' }); }
-      const fingerprint = input.fingerprint || ""; 
-      const subnetKey = getSubnetKey(ip);
-      const primaryKey = fingerprint || deviceId || ip;
-      const keysToCheck = Array.from(new Set([primaryKey, ip, subnetKey, deviceId, fingerprint].filter(Boolean))) as string[];
-
-      for (const k of keysToCheck) { if (await isLocked(k)) { return { success: false, reason: "locked", remainingLockoutMs: await getRemainingLockoutTime(k) }; } }
-
-      const correctAngle = 65; const tolerance = 0.5; const isCorrect = input.angle >= correctAngle - tolerance && input.angle <= correctAngle + tolerance;
-      const ua = ctx.req.headers["user-agent"] || "unknown"; const parsedUA = parseUserAgent(ua); if (input.browser) parsedUA.browserFamily = input.browser as any;
-      const geo = await fetchGeo(ip); const isVpn = detectVpnUsage(fingerprint, ip, geo);
-      await addHistory(ip, fingerprint, deviceId, input.angle, isCorrect, ua, parsedUA, geo, isVpn);
-
-      if (isCorrect) { await resetAttempts(keysToCheck, ip, fingerprint); return { success: true, reason: "correct", angle: input.angle }; }
-      else {
-        let lastResult: any = null;
-        for (const k of keysToCheck) { lastResult = await recordFailedAttempt(k, ip, fingerprint); }
-        return { success: false, reason: isVpn? "vpn_detected" : "incorrect", remainingAttempts: lastResult.remainingAttempts, isLocked: lastResult.isLocked, lockedUntil: lastResult.lockedUntil, remainingLockoutMs: lastResult.isLocked? (lastResult.lockedUntil?.getTime() || 0) - Date.now() : 0, isVpn };
-      }
-    }),
+  getStatus: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ ctx, input }) => {
+    const ip = getClientIp(ctx.req); const { deviceId, cookieId } = ensureDoubleCookie(ctx, input.deviceId); const fingerprint = input.fingerprint || ""; const subnetKey = getSubnetKey(ip);
+    const primaryKey = fingerprint || deviceId || cookieId || ip; const keysToCheck = Array.from(new Set([primaryKey, ip, subnetKey, deviceId, cookieId, fingerprint].filter(Boolean))) as string[];
+    for (const k of keysToCheck) { if (await isLocked(k)) { return { isLocked: true, locked: true, remainingAttempts: 0, attemptsLeft: 0, remainingLockoutMs: await getRemaining(k), remainingMs: await getRemaining(k) }; } }
+    const rec = await getRecord(primaryKey); const left = rec? Math.max(0, MAX_ATTEMPTS - rec.failed_attempts) : MAX_ATTEMPTS;
+    return { isLocked: false, locked: false, remainingAttempts: left, attemptsLeft: left, remainingLockoutMs: 0, remainingMs: 0, maxAttempts: MAX_ATTEMPTS };
   }),
-  admin: router({
-    getAttempts: publicProcedure.input(z.object({ limit: z.number().default(100), offset: z.number().default(0) })).query(async ({ input }) => { return historyStore.slice(input.offset, input.offset + input.limit); }),
-    getStats: publicProcedure.query(async () => {
-      const total = historyStore.length; const ok = historyStore.filter(h => h.isCorrect === 1).length; const fail = total - ok; const uniq = attemptStore.size; const locked = Array.from(attemptStore.values()).filter(r => r.lockedUntil && r.lockedUntil.getTime() > Date.now()).length; const vpn = historyStore.filter(h => h.isVpn).length;
-      return { totalAttempts: total, uniqueIps: uniq, uniqueIPs: uniq, successfulAttempts: ok, failedAttempts: fail, currentlyLockedIps: locked, lockedIPs: locked, successRate: total? Math.round((ok / total) * 100) : 0, repeatedOffenders: Array.from(attemptStore.values()).filter(r => r.isRepeatedOffender).length, vpnAttempts: vpn };
-    }),
-    getAdvancedAnalytics: publicProcedure.query(async () => {
-      const total = historyStore.length; const ok = historyStore.filter(h => h.isCorrect === 1).length; const fail = total - ok; const uniq = attemptStore.size;
-      const byCountry: Record<string, number> = {}; historyStore.forEach(h => { byCountry[h.country] = (byCountry[h.country] || 0) + 1; }); const geoDist = Object.entries(byCountry).map(([country, count]) => ({ country, count }));
-      const byDevice: Record<string, number> = {}; historyStore.forEach(h => { byDevice[h.deviceType] = (byDevice[h.deviceType] || 0) + 1; }); const devDist = Object.entries(byDevice).map(([deviceType, count]) => ({ deviceType, count }));
-      const failedMap: Record<string, { total: number; fail: number; country: string; ips: string[]; isVpn: boolean }> = {};
-      historyStore.forEach(h => { const k = h.fingerprint || h.deviceId || h.ipAddress; if (!failedMap[k]) failedMap[k] = { total: 0, fail: 0, country: h.country, ips: [], isVpn: false }; failedMap[k].total++; if (h.isCorrect === 0) failedMap[k].fail++; if (!failedMap[k].ips.includes(h.ipAddress)) failedMap[k].ips.push(h.ipAddress); if (h.isVpn) failedMap[k].isVpn = true; });
-      const repeat = Object.entries(failedMap).filter(([_, v]) => v.fail >= 2 || v.ips.length > 1).map(([id, v], idx) => ({ id: String(idx), ipAddress: v.ips.join(', '), fingerprint: id, country: v.country, totalAttempts: v.total, failedAttempts: v.fail, isVpn: v.isVpn, ips: v.ips }));
-      return { totalAttempts: total, uniqueIps: uniq, uniqueIPs: uniq, successfulAttempts: ok, failedAttempts: fail, successRate: total? String(Math.round((ok / total) * 100)) : "0", repeatOffenders: repeat, geographicDistribution: geoDist, deviceDistribution: devDist, vpnAttempts: historyStore.filter(h => h.isVpn).length };
-    }),
-    getUserProfile: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional() })).query(async ({ input }) => {
-      const key = input.fingerprint || input.deviceId || input.ipAddress; if (!key) return null; const history = historyStore.filter(h => h.fingerprint === key || h.deviceId === key || h.ipAddress === key); if (!history.length) return null; const first = history[0];
-      return { country: first.country, city: first.city, isp: first.isp, deviceType: first.deviceType, org: first.org, zip: first.zip, timezone: first.timezone, as: first.as, fingerprint: first.fingerprint, deviceId: first.deviceId, ips: Array.from(new Set(history.map(h => h.ipAddress))), isVpn: history.some(h => h.isVpn), attempts: history.map(h => ({ id: h.id, angle: h.angle, isCorrect: h.isCorrect, createdAt: h.createdAt, ip: h.ipAddress, isVpn: h.isVpn })) };
-    }),
-    exportData: publicProcedure.query(async () => {
-      const headers = ['ID','IP','Fingerprint','DeviceID','Kat','Poprawny','Data','Przegladarka','OS','Miasto','Kraj','VPN'];
-      const rows = historyStore.map(h => [h.id, h.ipAddress, h.fingerprint, h.deviceId, String(h.angle), h.isCorrect ? 'TAK' : 'NIE', h.createdAt.toISOString(), h.browserFamily, h.osFamily, h.city, h.country, h.isVpn ? 'TAK' : 'NIE']);
-      const csv = [headers.join(','), ...rows.map(r => r.map(v => '"' + v + '"').join(','))].join('\n');
-      return csv;
-    }),
-    unlockIp: publicProcedure.input(z.object({ ipAddress: z.string().optional(), fingerprint: z.string().optional(), deviceId: z.string().optional() })).mutation(async ({ input }) => {
-      const initialKeys = [input.fingerprint, input.deviceId, input.ipAddress].filter(Boolean) as string[];
-      if (initialKeys.length === 0) return { success: false, message: "Brak ID do odblokowania" };
-      const keysToDelete = new Set<string>(initialKeys);
-      // dodaj też klucze podsieci dla IP
-      for (const k of initialKeys){ if(isIPv4(k)) keysToDelete.add(getSubnetKey(k)); if(k.startsWith("subnet:")) keysToDelete.add(k); }
-
-      for (const h of historyStore) {
-        const matches = initialKeys.some(k => k === h.ipAddress || k === h.fingerprint || k === h.deviceId);
-        if (matches) {
-          if (h.ipAddress) { keysToDelete.add(h.ipAddress); if(isIPv4(h.ipAddress)) keysToDelete.add(getSubnetKey(h.ipAddress)); }
-          if (h.fingerprint && h.fingerprint !== "unknown") keysToDelete.add(h.fingerprint);
-          if (h.deviceId && h.deviceId !== "unknown") keysToDelete.add(h.deviceId);
-        }
-      }
-      for (const [storeKey, rec] of attemptStore.entries()) {
-        const shouldDelete = keysToDelete.has(storeKey) || initialKeys.some(k => rec.ips.has(k) || rec.fingerprints.has(k));
-        if (shouldDelete) {
-          keysToDelete.add(storeKey);
-          rec.ips.forEach(ip => { keysToDelete.add(ip); if(isIPv4(ip)) keysToDelete.add(getSubnetKey(ip)); });
-          rec.fingerprints.forEach(fp => { if (fp !== "unknown") keysToDelete.add(fp); });
-        }
-      }
-      for (const k of Array.from(keysToDelete)) {
-        const rec = attemptStore.get(k);
-        if (rec) {
-          rec.ips.forEach(ip => { keysToDelete.add(ip); if(isIPv4(ip)) keysToDelete.add(getSubnetKey(ip)); });
-          rec.fingerprints.forEach(fp => { if (fp !== "unknown") keysToDelete.add(fp); });
-        }
-      }
-      let deletedCount = 0;
-      for (const k of keysToDelete) { if (attemptStore.delete(k)) deletedCount++; }
-      return { success: true, deletedKeys: Array.from(keysToDelete), deletedCount };
-    }),
-    verifyPin: publicProcedure.input(z.object({ pin: z.string() })).mutation(async ({ input }) => { const adminPin = ENV.adminPin; if (!adminPin) return { success: false, error: "Admin PIN not configured" }; return { success: input.pin === adminPin }; }),
-    getLockedIPs: publicProcedure.query(async () => { const locked: string[] = []; for (const [key, rec] of attemptStore.entries()) { if (rec.lockedUntil && rec.lockedUntil.getTime() > Date.now()) locked.push(key); } return locked; }),
+  verify: publicProcedure.input(z.object({ angle: z.number(), fingerprint: z.string().optional(), deviceId: z.string().optional(), browser: z.string().optional(), os: z.string().optional() })).mutation(async ({ ctx, input }) => {
+    (ctx as any).user = { id: 1, openId: "public-user", name: "Gość", email: "guest@example.com", loginMethod: "public", role: "user", createdAt: new Date(), updatedAt: new Date(), lastSignedIn: new Date() } as any;
+    const ip = getClientIp(ctx.req); const { deviceId, cookieId } = ensureDoubleCookie(ctx, input.deviceId); const fingerprint = input.fingerprint || "";
+    const subnetKey = getSubnetKey(ip); const primaryKey = fingerprint || deviceId || cookieId || ip;
+    const keysToCheck = Array.from(new Set([primaryKey, ip, subnetKey, deviceId, cookieId, fingerprint].filter(Boolean))) as string[];
+    for (const k of keysToCheck) { if (await isLocked(k)) { return { success: false, reason: "locked" as const, remainingLockoutMs: await getRemaining(k) }; } }
+    const isCorrect = Math.abs(input.angle - CORRECT_ANGLE) <= TOLERANCE;
+    const vpnInfo = await checkVpnAndUpdate(fingerprint, ip);
+    if (isCorrect) { await clearLock(keysToCheck); await logAttempt({ ip, angle: input.angle, status: 'success', browser: input.browser, fingerprint, deviceId }); return { success: true, reason: "correct" as const }; }
+    else { const res = await incrementFail(keysToCheck, fingerprint, ip); await logAttempt({ ip, angle: input.angle, status: res.locked ? 'locked' : vpnInfo.isVpn ? 'vpn' : 'fail', browser: input.browser, fingerprint, deviceId }); if (res.locked) return { success: false, reason: "locked" as const, remainingLockoutMs: res.duration, remainingAttempts: 0, isRepeat: res.duration === REPEAT_LOCKOUT_MS, lockoutDays: res.duration/86400000 }; const rec = await getRecord(primaryKey); const left = rec? Math.max(0, MAX_ATTEMPTS - rec.failed_attempts) : MAX_ATTEMPTS - 1; return { success: false, reason: vpnInfo.isVpn ? "vpn_detected" as const : "invalid_angle" as const, remainingAttempts: left }; }
   }),
 });
+
+export const adminRouter = router({
+  verifyPin: publicProcedure.input(z.object({ pin: z.string() })).mutation(async ({ input }) => { if (input.pin === ADMIN_PIN) return { ok: true, success: true }; throw new Error("Nieprawidłowy PIN"); }),
+  list: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT lock_key, lock_key as ip, lock_key as fingerprint, failed_attempts, locked_until, last_attempt_at, is_subnet, total_locks, total_attempts FROM lockouts WHERE locked_until > NOW() ORDER BY last_attempt_at DESC LIMIT 100`); return rows as any; } catch { return [] as any; } }),
+  getBlocked: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT lock_key, lock_key as ip, lock_key as fingerprint, failed_attempts, locked_until, last_attempt_at, total_locks FROM lockouts WHERE locked_until > NOW()`); return rows as any; } catch { return [] as any; } }),
+  getBlockedDevices: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT lock_key, lock_key as ip, lock_key as fingerprint, failed_attempts, locked_until, last_attempt_at, is_subnet, total_locks FROM lockouts WHERE locked_until > NOW()`); return rows as any; } catch { return [] as any; } }),
+  getAllBlocked: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT * FROM lockouts WHERE locked_until > NOW()`); return rows as any; } catch { return [] as any; } }),
+  // MAX przechowywanie - 10k rekordów zamiast 100, bez kasowania
+  history: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT id, COALESCE(ip, fingerprint, device_id, '0.0.0.0') as ip, angle, status, COALESCE(browser, device_id, fingerprint, '-') as device, fingerprint, COALESCE(localization, subnet, '-') as localization, created_at as time, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; } catch { return [] as any; } }),
+  getLogs: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT * FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; } catch { return [] as any; } }),
+  getHistory: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT * FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; } catch { return [] as any; } }),
+  getAttempts: publicProcedure.query(async () => { try { await ensureTable(); const [rows] = await getPool().query(`SELECT * FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; } catch { return [] as any; } }),
+  unblock: publicProcedure.input(z.object({ key: z.string().optional(), ip: z.string().optional(), fingerprint: z.string().optional() }).or(z.string())).mutation(async ({ input }) => {
+    await ensureTable(); const p = getPool(); const key = typeof input === 'string' ? input : (input.key || input.ip || input.fingerprint || ''); if (!key) return { ok: true };
+    if (key.startsWith("subnet:")) { await p.query(`DELETE FROM lockouts WHERE lock_key=? OR lock_key LIKE?`, [key, `${key.replace("subnet:","")}.%`]); } else { await clearLock([key]); await p.query(`DELETE FROM lockouts WHERE lock_key LIKE ?`, [`%${key}%`]); }
+    return { ok: true };
+  }),
+  clearAll: publicProcedure.mutation(async () => { await ensureTable(); const p = getPool(); await p.query(`DELETE FROM lockouts`); await p.query(`DELETE FROM device_networks`); await p.query(`DELETE FROM attempt_logs`); return { ok: true }; }),
+  clearLogs: publicProcedure.mutation(async () => { await ensureTable(); await getPool().query(`DELETE FROM attempt_logs`); return { ok: true }; }),
+  clearHistory: publicProcedure.mutation(async () => { await ensureTable(); await getPool().query(`DELETE FROM attempt_logs`); return { ok: true }; }),
+  forceUnblockMe: publicProcedure.input(z.object({ fingerprint: z.string().optional(), deviceId: z.string().optional() })).mutation(async ({ ctx, input }) => {
+    const ip = getClientIp(ctx.req); const { deviceId, cookieId } = ensureDoubleCookie(ctx, input.deviceId); const fingerprint = input.fingerprint || ""; const subnetKey = getSubnetKey(ip); const primaryKey = fingerprint || deviceId || cookieId || ip;
+    const keysToCheck = Array.from(new Set([primaryKey, ip, subnetKey, deviceId, cookieId, fingerprint].filter(Boolean))) as string[];
+    await clearLock(keysToCheck); return { ok: true };
+  }),
+  adminUnblock: publicProcedure.input(z.object({ key: z.string() })).mutation(async ({ input }) => { await ensureTable(); await clearLock([input.key]); return { ok: true }; }),
+  adminClearAll: publicProcedure.mutation(async () => { await ensureTable(); const p = getPool(); await p.query(`DELETE FROM lockouts`); await p.query(`DELETE FROM attempt_logs`); return { ok: true }; }),
+});
+
+export const appRouter = router({ angle: angleRouter, admin: adminRouter, status: angleRouter.status, getStatus: angleRouter.getStatus, verify: angleRouter.verify, });
 export type AppRouter = typeof appRouter;
