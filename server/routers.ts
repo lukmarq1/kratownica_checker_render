@@ -8,7 +8,7 @@ import { parseUserAgent } from "./userAgentParser";
 import crypto from "crypto";
 
 const MAX_ATTEMPTS = 2;
-const LOCKOUT_MS = 24 * 60 * 60 * 1000;
+const LOCKOUT_MS = 30 * 24 * 60 * 60 * 1000; // 30 dni
 const VPN_DETECTION_WINDOW_MS = 60 * 60 * 1000;
 
 interface AttemptRecord {
