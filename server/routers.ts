@@ -10,6 +10,7 @@ const COOKIE_NAME = "__Host-kratownica_did";
 const CORRECT_ANGLE = 65;
 const TOLERANCE = 2;
 const ADMIN_PIN = process.env.ADMIN_PIN || "1234";
+const GEO_PROVIDER_TIMEOUT_MS = 1300;
 
 let pool: mysql.Pool | null = null;
 function getPool(){ if(pool) return pool; const raw=process.env.DATABASE_URL; if(!raw) throw new Error("Brak DATABASE_URL"); const u=new URL(raw); pool=mysql.createPool({host:u.hostname,port:Number(u.port||3306),user:decodeURIComponent(u.username),password:decodeURIComponent(u.password),database:u.pathname.replace(/^\//,"")||"defaultdb",ssl:{rejectUnauthorized:false} as any,waitForConnections:true,connectionLimit:10}); return pool; }
@@ -41,69 +42,52 @@ function isIPv4(ip:string){ return /^\d+\.\d+\.\d+\.\d+$/.test(ip); }
 function isPrivateIp(ip:string){ return ip==="127.0.0.1"||ip==="0.0.0.0"||ip.startsWith("10.")||ip.startsWith("192.168.")||/^172\.(1[6-9]|2\d|3[0-1])\./.test(ip); }
 function getSubnet(ip:string){ ip=normalizeIp(ip); if(!isIPv4(ip)) return ip; return ip.split(".").slice(0,3).join("."); }
 function getSubnetKey(ip:string){ return `subnet:${getSubnet(ip)}`; }
+function isMullvadRange(ip:string){ return normalizeIp(ip).startsWith("185.132.178."); }
 function parseCookies(req:any):Record<string,string>{ const h=req.headers?.cookie||""; const o:Record<string,string>={}; h.split(";").forEach((p:string)=>{const [k,...v]=p.trim().split("="); if(k) o[k]=decodeURIComponent(v.join("="));}); return o; }
 function ensureDoubleCookie(ctx:any,id?:string){ const c=parseCookies(ctx.req); let cid=c[COOKIE_NAME]; let did=id || (ctx.req.headers?.["x-device-id"] as string) || cid; if(!cid){ cid=did||crypto.randomUUID(); try{ ctx.res?.setHeader?.("Set-Cookie",`${COOKIE_NAME}=${cid}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${60*60*24*365}`);}catch{} } if(!did) did=cid; return {deviceId:did!,cookieId:cid!}; }
 
+type NormGeo = {country:string; city:string; zip:string; timezone:string; isp:string; org:string; as:string; lat:number|null; lon:number|null; query:string; regionName:string};
+function emptyGeo(ip:string):NormGeo{ return {country:"",city:"",zip:"",timezone:"",isp:"",org:"",as:"",lat:null,lon:null,query:ip,regionName:""}; }
+
+const geoProviders: {name:string; url:(ip:string)=>string; parse:(j:any, ip:string)=>NormGeo|null}[] = [
+  { name: "ip.sb", url: (ip)=>`https://api.ip.sb/geoip/${ip}`, parse: (j, ip)=>{ if(!j?.country) return null; return {country:j.country_code||j.country, city:j.city||"", zip:"", timezone:j.timezone||"", isp:j.isp||j.organization||"", org:j.organization||"", as:j.asn?String(j.asn):"", lat:j.latitude??null, lon:j.longitude??null, query:ip, regionName:j.region||""}; } },
+  { name: "geojs", url: (ip)=>`https://get.geojs.io/v1/ip/geo/${ip}.json`, parse: (j, ip)=>{ if(!j?.country) return null; return {country:j.country_code||j.country, city:j.city||"", zip:"", timezone:j.timezone||"", isp:j.organization_name||j.organization||"", org:j.organization_name||"", as:j.asn?String(j.asn):"", lat:j.latitude?Number(j.latitude):null, lon:j.longitude?Number(j.longitude):null, query:ip, regionName:j.region||""}; } },
+  { name: "freeipapi", url: (ip)=>`https://freeipapi.com/api/json/${ip}`, parse: (j, ip)=>{ if(!j?.countryName &&!j?.countryCode) return null; return {country:j.countryCode||j.countryName, city:j.cityName||"", zip:j.zipCode||"", timezone:j.timeZone||"", isp:"", org:"", as:"", lat:j.latitude??null, lon:j.longitude??null, query:ip, regionName:j.regionName||""}; } },
+  { name: "ipinfo", url: (ip)=>`https://ipinfo.io/${ip}/json`, parse: (j, ip)=>{ if(!j?.country) return null; let lat:number|null=null, lon:number|null=null; if(typeof j.loc==="string" && j.loc.includes(",")){ const [a,b]=j.loc.split(","); lat=Number(a); lon=Number(b); } const orgRaw=j.org||""; const isp=orgRaw.replace(/^AS\d+\s*/,""); return {country:j.country, city:j.city||"", zip:j.postal||"", timezone:j.timezone||"", isp:isp||orgRaw, org:orgRaw, as:(orgRaw.match(/^AS\d+/)||[""])[0], lat, lon, query:ip, regionName:j.region||""}; } },
+  { name: "ipwho.is", url: (ip)=>`https://ipwho.is/${ip}`, parse: (j, ip)=>{ if(j?.success===false ||!j?.country) return null; return {country:j.country_code||j.country, city:j.city||"", zip:j.postal||"", timezone:j.timezone?.id||j.timezone||"", isp:j.connection?.isp||j.isp||j.connection?.org||"", org:j.connection?.org||"", as:j.connection?.asn?String(j.connection.asn):"", lat:j.latitude??null, lon:j.longitude??null, query:ip, regionName:j.region||""}; } },
+  { name: "ipapi.co", url: (ip)=>`https://ipapi.co/${ip}/json/`, parse: (j, ip)=>{ if(!j?.country_name &&!j?.country_code) return null; return {country:j.country_code||j.country_name, city:j.city||"", zip:j.postal||"", timezone:j.timezone||"", isp:j.org||"", org:j.org||"", as:j.asn||"", lat:j.latitude??null, lon:j.longitude??null, query:ip, regionName:j.region||""}; } },
+  { name: "ip-api.com", url: (ip)=>`https://ip-api.com/json/${ip}?fields=status,country,countryCode,city,zip,timezone,isp,org,as,lat,lon,query,regionName`, parse: (j, ip)=>{ if(j?.status!=="success") return null; return {country:j.countryCode||j.country, city:j.city||"", zip:j.zip||"", timezone:j.timezone||"", isp:j.isp||j.org||"", org:j.org||"", as:j.as||"", lat:j.lat??null, lon:j.lon??null, query:ip, regionName:j.regionName||""}; } },
+];
+
 const geoCache = new Map<string, any>();
 async function fetchGeoFast(ip:string, req?:any){
-  ip=normalizeIp(ip); if(geoCache.has(ip)) return geoCache.get(ip);
-  if(!isIPv4(ip)) return null;
-  if(isPrivateIp(ip)) return {country:"Local",city:"LAN",isp:"Private",query:ip,lat:null,lon:null};
-  try{ const h=req?.headers||{}; const cc=h["cf-ipcountry"]||h["x-country"]; if(cc && cc!=="XX" && cc!=="T1"){ const g={country:cc,city:h["cf-ipcity"]||h["x-city"]||"",timezone:h["cf-timezone"]||"",isp:h["cf-isp"]||"",org:"",as:"",lat:h["cf-iplatitude"]?Number(h["cf-iplatitude"]):null,lon:h["cf-iplongitude"]?Number(h["cf-iplongitude"]):null,query:ip,regionName:""}; geoCache.set(ip,g); return g; } }catch{}
-  const providers=[
-    `https://ipwho.is/${ip}`,
-    `https://ipapi.co/${ip}/json/`,
-    `https://ip-api.com/json/${ip}?fields=status,country,city,zip,timezone,isp,org,as,lat,lon,query,regionName`
-  ];
-  for(const url of providers){
+  ip=normalizeIp(ip); if(geoCache.has(ip)) return geoCache.get(ip); if(!isIPv4(ip)) return null;
+  if(isPrivateIp(ip)){ const g={country:"Local",city:"LAN",isp:"Private",query:ip,lat:null,lon:null}; geoCache.set(ip,g); return g; }
+  for(const provider of geoProviders){
     try{
-      const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(),1200);
-      const res=await fetch(url,{signal:ctrl.signal,headers:{"User-Agent":"kratownica/1.0"}} as any);
-      clearTimeout(t); if(!res.ok) continue; const j=await res.json() as any;
-      if(j?.success===false) continue;
-      if(j?.status==="fail") continue;
-      if(j?.country){ const g={country:j.country, city:j.city||"", zip:j.postal||j.zip||"", timezone:j.timezone?.id||j.timezone||"", isp:j.connection?.isp||j.isp||j.org||"", org:j.connection?.org||j.org||"", as:j.connection?.asn||j.asn||"", lat:j.latitude||j.lat||null, lon:j.longitude||j.lon||null, query:ip, regionName:j.region||j.regionName||""}; geoCache.set(ip,g); return g; }
-      if(j?.country_name){ const g={country:j.country_code||j.country_name, city:j.city||"", zip:"", timezone:j.timezone||"", isp:j.isp||j.org||"", org:j.org||"", as:j.asn||"", lat:j.latitude||null, lon:j.longitude||null, query:ip, regionName:j.region||""}; geoCache.set(ip,g); return g; }
-      if(j?.status==="success"){ geoCache.set(ip,j); return j; }
+      const ctrl=new AbortController(); const t=setTimeout(()=>ctrl.abort(),GEO_PROVIDER_TIMEOUT_MS);
+      const res=await fetch(provider.url(ip),{signal:ctrl.signal,headers:{"User-Agent":"kratownica/1.0","Accept":"application/json"}} as any);
+      clearTimeout(t); if(!res.ok) continue; const j=await res.json() as any; const parsed=provider.parse(j, ip);
+      if(parsed && parsed.country){ if(!parsed.isp && isMullvadRange(ip)) parsed.isp="Mullvad VPN"; geoCache.set(ip,parsed); return parsed; }
     }catch{}
   }
-  return {country:"",city:"",isp:"",query:ip,lat:null,lon:null,note:"geo blocked"};
+  try{
+    const h=req?.headers||{}; const cc=h["cf-ipcountry"]||h["x-country"];
+    if(cc && cc!=="XX" && cc!=="T1"){
+      const g:NormGeo={ country:String(cc), city:String(h["cf-ipcity"]||h["x-city"]||""), zip:"", timezone:String(h["cf-timezone"]||""), isp: isMullvadRange(ip)? "Mullvad VPN" : "", org:"", as:"", lat:h["cf-iplatitude"]?Number(h["cf-iplatitude"]):null, lon:h["cf-iplongitude"]?Number(h["cf-iplongitude"]):null, query:ip, regionName:"" };
+      geoCache.set(ip,g); return g;
+    }
+  }catch{}
+  const fallback=emptyGeo(ip); if(isMullvadRange(ip)) fallback.isp="Mullvad VPN"; (fallback as any).note="geo blocked"; geoCache.set(ip,fallback); return fallback;
 }
 
 async function getRecord(key:string){ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT failed_attempts, locked_until FROM lockouts WHERE lock_key=?`,[key]); return (rows as any[])[0]||null; }
-async function getRemainingMax(keys:string[]){
-  if(!keys.length) return 0;
-  const now=Date.now();
-  const vals=await Promise.all(keys.map(k=>getRecord(k).then(r=>{ if(!r?.locked_until) return 0; return Math.max(0,new Date(r.locked_until).getTime()-now); }).catch(()=>0)));
-  return Math.max(0,...vals);
-}
+async function getRemainingMax(keys:string[]){ if(!keys.length) return 0; const now=Date.now(); const vals=await Promise.all(keys.map(k=>getRecord(k).then(r=>{ if(!r?.locked_until) return 0; return Math.max(0,new Date(r.locked_until).getTime()-now); }).catch(()=>0))); return Math.max(0,...vals); }
 async function getRepeatDuration(fp:string,ip:string){ try{ const p=getPool(); if(fp){ const [dn]=await p.query<any[]>(`SELECT first_ip,last_ip FROM device_networks WHERE fingerprint=?`,[fp]); const d=(dn as any[])[0]; if(d && d.first_ip!==d.last_ip) return REPEAT_LOCKOUT_MS; } }catch{} return BASE_LOCKOUT_MS; }
-
-async function lockKeys(keys:string[],fp?:string,ip?:string){
-  if(!keys.length) return BASE_LOCKOUT_MS; await ensureTable(); const p=getPool(); const dur=await getRepeatDuration(fp||"",ip||""); const until=new Date(Date.now()+dur);
-  await Promise.all(keys.map(k=>p.query(`INSERT INTO lockouts (lock_key,failed_attempts,locked_until,last_attempt_at,is_subnet) VALUES (?,?,?,NOW(),?) ON DUPLICATE KEY UPDATE failed_attempts=VALUES(failed_attempts), locked_until=VALUES(locked_until), last_attempt_at=NOW()`,[k,MAX_ATTEMPTS,until,k.startsWith("subnet:")?1:0]).catch(()=>{})));
-  return dur;
-}
-async function incrementFail(keys:string[],fp?:string,ip?:string){
-  if(!keys.length) return {locked:false,duration:BASE_LOCKOUT_MS}; await ensureTable();
-  const recs=await Promise.all(keys.map(k=>getRecord(k).catch(()=>null)));
-  const shouldLock=recs.some(r=>((r?.failed_attempts||0)+1)>=MAX_ATTEMPTS);
-  if(shouldLock){ const d=await lockKeys(keys,fp,ip); return {locked:true,duration:d}; }
-  const p=getPool();
-  await Promise.all(keys.map(async k=>{ const r=recs[keys.indexOf(k)]; const fails=(r?.failed_attempts||0)+1; await p.query(`INSERT INTO lockouts (lock_key,failed_attempts,last_attempt_at) VALUES (?,?,NOW()) ON DUPLICATE KEY UPDATE failed_attempts=?, last_attempt_at=NOW()`,[k,fails,fails]).catch(()=>{}); }));
-  return {locked:false,duration:BASE_LOCKOUT_MS};
-}
+async function lockKeys(keys:string[],fp?:string,ip?:string){ if(!keys.length) return BASE_LOCKOUT_MS; await ensureTable(); const p=getPool(); const dur=await getRepeatDuration(fp||"",ip||""); const until=new Date(Date.now()+dur); await Promise.all(keys.map(k=>p.query(`INSERT INTO lockouts (lock_key,failed_attempts,locked_until,last_attempt_at,is_subnet) VALUES (?,?,?,NOW(),?) ON DUPLICATE KEY UPDATE failed_attempts=VALUES(failed_attempts), locked_until=VALUES(locked_until), last_attempt_at=NOW()`,[k,MAX_ATTEMPTS,until,k.startsWith("subnet:")?1:0]).catch(()=>{}))); return dur; }
+async function incrementFail(keys:string[],fp?:string,ip?:string){ if(!keys.length) return {locked:false,duration:BASE_LOCKOUT_MS}; await ensureTable(); const recs=await Promise.all(keys.map(k=>getRecord(k).catch(()=>null))); const shouldLock=recs.some(r=>((r?.failed_attempts||0)+1)>=MAX_ATTEMPTS); if(shouldLock){ const d=await lockKeys(keys,fp,ip); return {locked:true,duration:d}; } const p=getPool(); await Promise.all(keys.map(async k=>{ const r=recs[keys.indexOf(k)]; const fails=(r?.failed_attempts||0)+1; await p.query(`INSERT INTO lockouts (lock_key,failed_attempts,last_attempt_at) VALUES (?,?,NOW()) ON DUPLICATE KEY UPDATE failed_attempts=?, last_attempt_at=NOW()`,[k,fails,fails]).catch(()=>{}); })); return {locked:false,duration:BASE_LOCKOUT_MS}; }
 async function clearLock(keys:string[]){ if(!keys.length) return; await ensureTable(); const p=getPool(); const ph=keys.map(()=>"?" ).join(","); await p.query(`DELETE FROM lockouts WHERE lock_key IN (${ph})`,keys).catch(()=>{}); }
-
-async function logAttempt(d:{ip:string,angle:number,status:'success'|'fail'|'locked'|'vpn',browser?:string,fingerprint?:string,deviceId?:string,req?:any,os?:string}){
-  try{
-    await ensureTable(); const p=getPool(); const cleanIp=normalizeIp(d.ip); const subnet=getSubnet(cleanIp);
-    const minimalLoc=JSON.stringify({ip:cleanIp,subnet,browser:d.browser?.slice(0,120)||""});
-    const [res]=await p.query<any>(`INSERT INTO attempt_logs (ip,subnet,angle,status,browser,fingerprint,device_id,localization) VALUES (?,?,?,?,?,?,?,?)`,[cleanIp,subnet,d.angle,d.status,d.browser?.slice(0,500)||null,d.fingerprint||null,d.deviceId||null,minimalLoc]) as any;
-    const id=res?.insertId;
-    if(id){ fetchGeoFast(cleanIp,d.req).then(async geo=>{ if(!geo) return; const full={...geo,ip:cleanIp,subnet,browser:d.browser?.slice(0,120)}; await p.query(`UPDATE attempt_logs SET localization=? WHERE id=?`,[JSON.stringify(full),id]).catch(()=>{}); }).catch(()=>{}); }
-  }catch(e){ console.error("logAttempt",e); }
-}
+async function logAttempt(d:{ip:string,angle:number,status:'success'|'fail'|'locked'|'vpn',browser?:string,fingerprint?:string,deviceId?:string,req?:any,os?:string}){ try{ await ensureTable(); const p=getPool(); const cleanIp=normalizeIp(d.ip); const subnet=getSubnet(cleanIp); const minimalLoc=JSON.stringify({ip:cleanIp,subnet,browser:d.browser?.slice(0,120)||""}); const [res]=await p.query<any>(`INSERT INTO attempt_logs (ip,subnet,angle,status,browser,fingerprint,device_id,localization) VALUES (?,?,?,?,?,?,?,?)`,[cleanIp,subnet,d.angle,d.status,d.browser?.slice(0,500)||null,d.fingerprint||null,d.deviceId||null,minimalLoc]) as any; const id=res?.insertId; if(id){ fetchGeoFast(cleanIp,d.req).then(async geo=>{ if(!geo) return; const full={...geo,ip:cleanIp,subnet,browser:d.browser?.slice(0,120)}; await p.query(`UPDATE attempt_logs SET localization=? WHERE id=?`,[JSON.stringify(full),id]).catch(()=>{}); }).catch(()=>{}); } }catch(e){ console.error("logAttempt",e); } }
 async function checkVpnAndUpdate(fp:string,ip:string){ if(!fp||fp==="fp-fallback") return {isVpn:false}; try{ await ensureTable(); const p=getPool(); const subnet=getSubnet(ip); const [rows]=await p.query<any[]>(`SELECT first_subnet,last_ip,last_subnet FROM device_networks WHERE fingerprint=?`,[fp]); const ex=(rows as any[])[0]; if(!ex){ await p.query(`INSERT INTO device_networks (fingerprint,first_ip,first_subnet,last_ip,last_subnet) VALUES (?,?,?,?,?)`,[fp,ip,subnet,ip,subnet]); return {isVpn:false}; } const changed=ex.last_ip!==ip||ex.last_subnet!==subnet; await p.query(`UPDATE device_networks SET last_ip=?,last_subnet=? WHERE fingerprint=?`,[ip,subnet,fp]); return {isVpn:changed && ex.first_subnet!==subnet}; }catch{ return {isVpn:false}; } }
 async function getLockedFromDB(){ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT * FROM lockouts WHERE locked_until > NOW()`); return (rows as any[]).map(r=>({...r, lock_key:r.lock_key, ip:r.lock_key, fingerprint:r.lock_key })); }
 
@@ -121,7 +105,7 @@ export const adminRouter = router({
   getAllBlocked: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
   getLockedIPs: publicProcedure.query(async()=>{ const d=await getLockedFromDB(); return d.map(x=>x.lock_key); }),
   getLockedDevices: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
-  history: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT id, ip, COALESCE(NULLIF(ip,''),fingerprint,device_id,'0.0.0.0') as display_ip, angle, status, COALESCE(NULLIF(browser,''),device_id,fingerprint,'-') as device, browser, fingerprint, device_id, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as Czas FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{}; const ip=r.ip||loc.query||loc.ip||r.display_ip; return {...r, ip, display_ip:ip, localization:r.localization, country:loc.country||"", city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", lat:loc.lat??null, lon:loc.lon??null, coords:loc.lat?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, browser: r.browser||loc.browser||""}; }); }catch(e){ console.error(e); return [] as any; } }),
+  history: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT id, ip, COALESCE(NULLIF(ip,''),fingerprint,device_id,'0.0.0.0') as display_ip, angle, status, COALESCE(NULLIF(browser,''),device_id,fingerprint,'-') as device, browser, fingerprint, device_id, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as Czas FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{}; const ip=r.ip||loc.query||loc.ip||r.display_ip; return {...r, ip, display_ip:ip, localization:r.localization, country:loc.country||"", city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null && loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, browser: r.browser||loc.browser||""}; }); }catch(e){ console.error(e); return [] as any; } }),
   getLogs: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; }catch{ return [] as any; } }),
   getHistory: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; }catch{ return [] as any; } }),
   getAttempts: publicProcedure.input(z.object({limit:z.number().optional(),offset:z.number().optional()}).optional()).query(async({input})=>{ try{ await ensureTable(); const lim=input?.limit||100; const off=input?.offset||0; const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT? OFFSET?`,[lim,off]); return rows as any; }catch{ return [] as any; } }),
