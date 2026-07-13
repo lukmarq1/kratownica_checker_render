@@ -25,6 +25,8 @@ async function ensureTable(){
   try{ await p.query(`ALTER TABLE attempt_logs MODIFY COLUMN localization TEXT`); }catch{}
   try{ await p.query(`ALTER TABLE attempt_logs MODIFY COLUMN browser VARCHAR(500)`); }catch{}
   try{ await p.query(`ALTER TABLE attempt_logs MODIFY COLUMN device_id VARCHAR(500)`); }catch{}
+  try{ await p.query(`ALTER TABLE attempt_logs ADD COLUMN os VARCHAR(100) NULL`); }catch{}
+  try{ await p.query(`ALTER TABLE attempt_logs MODIFY COLUMN os VARCHAR(100)`); }catch{}
   tablesEnsured = true;
 }
 
@@ -89,12 +91,30 @@ const geoProviders: {name:string; url:(ip:string)=>string; parse:(j:any, ip:stri
 ];
 
 const geoCache = new Map<string, any>();
+function mergeGeo(base:NormGeo, add:NormGeo):NormGeo{
+  if(!base) return add;
+  if(!add) return base;
+  return {
+    country: base.country || add.country,
+    city: base.city || add.city,
+    zip: base.zip || add.zip,
+    timezone: base.timezone || add.timezone,
+    isp: base.isp || add.isp,
+    org: base.org || add.org,
+    as: base.as || add.as,
+    lat: base.lat ?? add.lat,
+    lon: base.lon ?? add.lon,
+    query: base.query || add.query,
+    regionName: base.regionName || add.regionName,
+  };
+}
 async function fetchGeoFast(ip:string, req?:any){
   ip=normalizeIp(ip);
   if(geoCache.has(ip)) return geoCache.get(ip);
   if(!isIPv4(ip)) return null;
-  if(isPrivateIp(ip)){ const g={country:"Local",city:"LAN",isp:"Private",query:ip,lat:null,lon:null}; geoCache.set(ip,g); return g; }
+  if(isPrivateIp(ip)){ const g={country:"Local",city:"LAN",isp:"Private",query:ip,lat:null,lon:null} as any; geoCache.set(ip,g); return g; }
 
+  let acc: NormGeo | null = null;
   for(const provider of geoProviders){
     try{
       const ctrl=new AbortController();
@@ -106,11 +126,14 @@ async function fetchGeoFast(ip:string, req?:any){
       const parsed=provider.parse(j, ip);
       if(parsed && parsed.country){
         if(!parsed.isp && isMullvadRange(ip)) parsed.isp="Mullvad VPN";
-        geoCache.set(ip,parsed);
-        return parsed;
+        if(!acc) acc = parsed;
+        else acc = mergeGeo(acc, parsed);
+        const hasEnough = acc.country && acc.city && acc.zip && acc.timezone && acc.isp && acc.lat!=null;
+        if(hasEnough) break;
       }
     }catch{ }
   }
+  if(acc){ geoCache.set(ip,acc); return acc; }
 
   try{
     const h=req?.headers||{};
@@ -152,21 +175,21 @@ function pushError(where:string, err:any){ try{ const m=err?.message||String(err
 
 async function clearLock(keys:string[]){ if(!keys.length) return; await ensureTable(); const p=getPool(); const ph=keys.map(()=>"?" ).join(","); await p.query(`DELETE FROM lockouts WHERE lock_key IN (${ph})`,keys).catch((e:any)=>pushError('clearLock',e)); }
 
-async function insertAttemptLog(d:{ip:string,angle:number,status:'success'|'fail'|'locked'|'vpn',browser?:string,fingerprint?:string,deviceId?:string}): Promise<number|null>{
+async function insertAttemptLog(d:{ip:string,angle:number,status:'success'|'fail'|'locked'|'vpn',browser?:string,fingerprint?:string,deviceId?:string,os?:string}): Promise<number|null>{
   try{
     await ensureTable(); const p=getPool();
     const cleanIp=normalizeIp(d.ip); const subnet=getSubnet(cleanIp);
-    const minimalLoc=JSON.stringify({ip:cleanIp,subnet,browser:(d.browser||"").slice(0,120),status:d.status,ts:Date.now()});
-    const [res]=await p.query<any>(`INSERT INTO attempt_logs (ip,subnet,angle,status,browser,fingerprint,device_id,localization) VALUES (?,?,?,?,?,?,?,?)`,[cleanIp,subnet,d.angle,d.status,(d.browser||"").slice(0,500)||null,d.fingerprint||null,d.deviceId||null,minimalLoc]);
+    const minimalLoc=JSON.stringify({ip:cleanIp,subnet,browser:(d.browser||"").slice(0,120),os:(d.os||"").slice(0,80),status:d.status,ts:Date.now()});
+    const [res]=await p.query<any>(`INSERT INTO attempt_logs (ip,subnet,angle,status,browser,fingerprint,device_id,os,localization) VALUES (?,?,?,?,?,?,?,?,?)`,[cleanIp,subnet,d.angle,d.status,(d.browser||"").slice(0,500)||null,d.fingerprint||null,d.deviceId||null,(d.os||"").slice(0,100)||null,minimalLoc]);
     const id=(res as any)?.insertId; return id||null;
   }catch(e:any){ pushError('insertAttemptLog',e); return null; }
 }
-async function backfillGeo(id:number, cleanIp:string, req:any, browser?:string){
+async function backfillGeo(id:number, cleanIp:string, req:any, browser?:string, os?:string){
   try{
     if(!id) return; const p=getPool();
     const geo=await fetchGeoFast(cleanIp, req);
     if(!geo) return;
-    const full={...geo, ip:cleanIp, subnet:getSubnet(cleanIp), browser:(browser||"").slice(0,120)};
+    const full={...geo, ip:cleanIp, subnet:getSubnet(cleanIp), browser:(browser||"").slice(0,120), os:(os||"").slice(0,80)};
     await p.query(`UPDATE attempt_logs SET localization=? WHERE id=?`,[JSON.stringify(full),id]);
   }catch(e:any){ pushError('backfillGeo',e); }
 }
@@ -177,7 +200,7 @@ async function getLockedFromDB(){ await ensureTable(); const [rows]=await getPoo
 export const angleRouter = router({
   status: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).query(async({ctx,input})=>{ const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0) return {isLocked:true,locked:true,remainingAttempts:0,attemptsLeft:0,remainingLockoutMs:rem,remainingMs:rem}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS; return {isLocked:false,locked:false,remainingAttempts:left,attemptsLeft:left,remainingLockoutMs:0,remainingMs:0,maxAttempts:MAX_ATTEMPTS}; }),
   getStatus: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).query(async({ctx,input})=>{ const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0) return {isLocked:true,locked:true,remainingAttempts:0,attemptsLeft:0,remainingLockoutMs:rem,remainingMs:rem}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS; return {isLocked:false,locked:false,remainingAttempts:left,attemptsLeft:left,remainingLockoutMs:0,remainingMs:0,maxAttempts:MAX_ATTEMPTS}; }),
-  verify: publicProcedure.input(z.object({angle:z.number(),fingerprint:z.string().optional(),deviceId:z.string().optional(),browser:z.string().optional(),os:z.string().optional()})).mutation(async({ctx,input})=>{ (ctx as any).user={id:1,openId:"public-user",name:"Gość",email:"guest@example.com",loginMethod:"public",role:"user",createdAt:new Date(),updatedAt:new Date(),lastSignedIn:new Date()} as any; const t0=Date.now(); const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0){ return {success:false,reason:"locked" as const,remainingLockoutMs:rem}; } const ok=Math.abs(input.angle-CORRECT_ANGLE)<=TOLERANCE; const vpnP=checkVpnAndUpdate(fp,ip); if(ok){ await clearLock(keys); const lid=await insertAttemptLog({ip,angle:input.angle,status:'success',browser:input.browser,fingerprint:fp,deviceId}); if(lid) backfillGeo(lid,ip,ctx.req,input.browser).catch(()=>{}); return {success:true,reason:"correct" as const, _ms:Date.now()-t0}; } else { const [vpnRes,incRes]=await Promise.all([vpnP, incrementFail(keys,fp,ip)]); const lid2=await insertAttemptLog({ip,angle:input.angle,status:incRes.locked?'locked':vpnRes.isVpn?'vpn':'fail',browser:input.browser,fingerprint:fp,deviceId}); if(lid2) backfillGeo(lid2,ip,ctx.req,input.browser).catch(()=>{}); if(incRes.locked) return {success:false,reason:"locked" as const,remainingLockoutMs:incRes.duration,remainingAttempts:0,isRepeat:incRes.duration===REPEAT_LOCKOUT_MS, _ms:Date.now()-t0}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS-1; return {success:false,reason:vpnRes.isVpn?"vpn_detected" as const:"invalid_angle" as const,remainingAttempts:left, _ms:Date.now()-t0}; } }),
+  verify: publicProcedure.input(z.object({angle:z.number(),fingerprint:z.string().optional(),deviceId:z.string().optional(),browser:z.string().optional(),os:z.string().optional()})).mutation(async({ctx,input})=>{ (ctx as any).user={id:1,openId:"public-user",name:"Gość",email:"guest@example.com",loginMethod:"public",role:"user",createdAt:new Date(),updatedAt:new Date(),lastSignedIn:new Date()} as any; const t0=Date.now(); const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0){ return {success:false,reason:"locked" as const,remainingLockoutMs:rem}; } const ok=Math.abs(input.angle-CORRECT_ANGLE)<=TOLERANCE; const vpnP=checkVpnAndUpdate(fp,ip); if(ok){ await clearLock(keys); const lid=await insertAttemptLog({ip,angle:input.angle,status:'success',browser:input.browser,fingerprint:fp,deviceId,os:input.os}); if(lid) backfillGeo(lid,ip,ctx.req,input.browser,input.os).catch(()=>{}); return {success:true,reason:"correct" as const, _ms:Date.now()-t0}; } else { const [vpnRes,incRes]=await Promise.all([vpnP, incrementFail(keys,fp,ip)]); const lid2=await insertAttemptLog({ip,angle:input.angle,status:incRes.locked?'locked':vpnRes.isVpn?'vpn':'fail',browser:input.browser,fingerprint:fp,deviceId,os:input.os}); if(lid2) backfillGeo(lid2,ip,ctx.req,input.browser,input.os).catch(()=>{}); if(incRes.locked) return {success:false,reason:"locked" as const,remainingLockoutMs:incRes.duration,remainingAttempts:0,isRepeat:incRes.duration===REPEAT_LOCKOUT_MS, _ms:Date.now()-t0}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS-1; return {success:false,reason:vpnRes.isVpn?"vpn_detected" as const:"invalid_angle" as const,remainingAttempts:left, _ms:Date.now()-t0}; } }),
 });
 
 export const adminRouter = router({
@@ -188,7 +211,7 @@ export const adminRouter = router({
   getAllBlocked: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
   getLockedIPs: publicProcedure.query(async()=>{ const d=await getLockedFromDB(); return d.map(x=>x.lock_key); }),
   getLockedDevices: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
-  history: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT id, ip, COALESCE(NULLIF(ip,''),fingerprint,device_id,'0.0.0.0') as display_ip, angle, status, COALESCE(NULLIF(browser,''),device_id,fingerprint,'-') as device, browser, fingerprint, device_id, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as Czas FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{}; const ip=r.ip||loc.query||loc.ip||r.display_ip; return {...r, ip, display_ip:ip, localization:r.localization, country:loc.country||"", city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null && loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, browser: r.browser||loc.browser||""}; }); }catch(e){ console.error(e); return [] as any; } }),
+  history: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT id, ip, COALESCE(NULLIF(ip,''),fingerprint,device_id,'0.0.0.0') as display_ip, angle, status, COALESCE(NULLIF(browser,''),device_id,fingerprint,'-') as device, browser, fingerprint, device_id, os, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as Czas FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{}; const ip=r.ip||loc.query||loc.ip||r.display_ip; return {...r, ip, display_ip:ip, localization:r.localization, country:loc.country||"", city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null && loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, browser: r.browser||loc.browser||"", os:r.os||loc.os||"", osFamily:r.os||loc.os||""}; }); }catch(e){ console.error(e); return [] as any; } }),
   getLogs: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; }catch{ return [] as any; } }),
   getHistory: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; }catch{ return [] as any; } }),
   getAttempts: publicProcedure.input(z.object({limit:z.number().optional(),offset:z.number().optional()}).optional()).query(async({input})=>{ try{ await ensureTable(); const lim=input?.limit||100; const off=input?.offset||0; const [rows]=await getPool().query<any[]>(`SELECT id, ip, angle, status, browser, fingerprint, device_id, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`,[lim,off]); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{} const ip=r.ip||loc.query||loc.ip||""; const country=loc.country||""; return { id:r.id, ip, ipAddress:ip, angle:r.angle, status:r.status, isCorrect:r.status==='success'?1:0, browser:r.browser||loc.browser||"", browserFamily:r.browser||loc.browser||"", fingerprint:r.fingerprint||"", deviceId:r.device_id||r.fingerprint||"", device_id:r.device_id||"", country, countryCode:country, city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", latitude:loc.lat??null, longitude:loc.lon??null, lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null&&loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, localization:r.localization, created_at:r.created_at, createdAt:r.created_at, osFamily:"", deviceType:"desktop" }; }); }catch(e){ console.error(e); return [] as any; } }),
