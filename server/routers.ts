@@ -111,17 +111,26 @@ async function sendBlockEmail(opts:{ip:string, subnet:string, fingerprint:string
     const mailer=await getMailerDynamic(); if(mailer){ await mailer.sendMail({from,to,subject,html}); }
   }catch(e:any){ pushError('sendBlockEmail',e); }
 }
-async function sendTelegramBlock(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
+async function sendTelegramBlock(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}):Promise<boolean>{
+  const token=(process.env.TELEGRAM_BOT_TOKEN||"").trim();
+  const chatId=(process.env.TELEGRAM_CHAT_ID||"").trim();
+  if(!token||!chatId){ console.error('[Telegram] BRAK env TELEGRAM_BOT_TOKEN lub TELEGRAM_CHAT_ID - alert pominięty', {hasToken:!!token, hasChatId:!!chatId}); return false; }
+  const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
+  const appUrl=(process.env.APP_URL||'https://kratownica-checker-render.onrender.com').replace(/\/$/,"");
+  const msg=`🚨 <b>ZABLOKOWANO</b>\n\n<b>IP:</b> <code>${opts.ip}</code>\n<b>Subnet:</b> <code>${opts.subnet}</code>\n<b>Powód:</b> ${opts.reason||'MAX_ATTEMPTS'}\n<b>Próby:</b> ${opts.count||'?'} \n<b>Czas:</b> ${now}\n\n<b>FP:</b> <code>${(opts.fingerprint||'').slice(0,20)}...</code>\n<b>Browser:</b> ${opts.browser||'?'} / ${opts.os||'?'} \n\n<a href="${appUrl}/admin">👉 Otwórz Panel</a>`;
+  const payload={chat_id:chatId,text:msg,parse_mode:"HTML",disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"🔓 Otwórz Admin",url:`${appUrl}/admin`}]]}};
+  console.log('[Telegram] try send', {ip:opts.ip, reason:opts.reason, chatId, tokenMasked: token.length>10 ? `${token.slice(0,6)}...${token.slice(-4)}` : '(too short)'});
   try{
-    const token=(process.env.TELEGRAM_BOT_TOKEN||"").trim();
-    const chatId=(process.env.TELEGRAM_CHAT_ID||"").trim();
-    if(!token||!chatId) return false;
-    const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
-    const appUrl=(process.env.APP_URL||'https://kratownica-checker-render.onrender.com').replace(/\/$/,"");
-    const msg=`🚨 <b>ZABLOKOWANO</b>\n\n<b>IP:</b> <code>${opts.ip}</code>\n<b>Subnet:</b> <code>${opts.subnet}</code>\n<b>Powód:</b> ${opts.reason||'MAX_ATTEMPTS'}\n<b>Próby:</b> ${opts.count||'?'} \n<b>Czas:</b> ${now}\n\n<b>FP:</b> <code>${(opts.fingerprint||'').slice(0,20)}...</code>\n<b>Browser:</b> ${opts.browser||'?'} / ${opts.os||'?'} \n\n<a href="${appUrl}/admin">👉 Otwórz Panel</a>`;
-    const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text:msg,parse_mode:"HTML",disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"🔓 Otwórz Admin",url:`${appUrl}/admin`}]]}})});
+    const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const bodyText=await r.text().catch(()=>'(brak treści odpowiedzi)');
+    console.log('[Telegram] response', r.status, bodyText);
+    if(!r.ok){ pushError('sendTelegramBlock:http', new Error(`Telegram HTTP ${r.status}: ${bodyText.slice(0,300)}`)); }
     return r.ok;
-  }catch(e:any){ pushError('sendTelegramBlock',e); return false; }
+  }catch(e:any){
+    console.error('[Telegram] fetch threw', e);
+    pushError('sendTelegramBlock:exception',e);
+    return false;
+  }
 }
 
 
@@ -249,7 +258,7 @@ async function getRecord(key:string){ await ensureTable(); const [rows]=await ge
 async function getRemainingMax(keys:string[]){ if(!keys.length) return 0; const now=Date.now(); const vals=await Promise.all(keys.map(k=>getRecord(k).then(r=>{ if(!r?.locked_until) return 0; return Math.max(0,new Date(r.locked_until).getTime()-now); }).catch(()=>0))); return Math.max(0,...vals); }
 async function getRepeatDuration(fp:string,ip:string){ try{ const p=getPool(); if(fp){ const [dn]=await p.query<any[]>(`SELECT first_ip,last_ip FROM device_networks WHERE fingerprint=?`,[fp]); const d=(dn as any[])[0]; if(d && d.first_ip!==d.last_ip) return REPEAT_LOCKOUT_MS; } }catch{} return BASE_LOCKOUT_MS; }
 async function lockKeys(keys:string[],fp?:string,ip?:string){ if(!keys.length) return BASE_LOCKOUT_MS; await ensureTable(); const p=getPool(); const dur=await getRepeatDuration(fp||"",ip||""); const until=new Date(Date.now()+dur); await Promise.all(keys.map(k=>p.query(`INSERT INTO lockouts (lock_key,failed_attempts,locked_until,last_attempt_at,is_subnet) VALUES (?,?,?,NOW(),?) ON DUPLICATE KEY UPDATE failed_attempts=VALUES(failed_attempts), locked_until=VALUES(locked_until), last_attempt_at=NOW()`,[k,MAX_ATTEMPTS,until,k.startsWith("subnet:")?1:0]).catch(()=>{}))); return dur; }
-async function incrementFail(keys:string[],fp?:string,ip?:string){ if(!keys.length) return {locked:false,duration:BASE_LOCKOUT_MS}; await ensureTable(); const recs=await Promise.all(keys.map(k=>getRecord(k).catch(()=>null))); const shouldLock=recs.some(r=>((r?.failed_attempts||0)+1)>=MAX_ATTEMPTS); if(shouldLock){ const d=await lockKeys(keys,fp,ip); try{ const ipKey=ip||""; const payload={ip:ipKey, subnet: ipKey? (ipKey.split('.').slice(0,3).join('.')+'.0/24'): "unknown", fingerprint:fp||keys[0]||"", deviceId:"", browser:"", os:"", reason: d>86400?'REPEAT_LOCKOUT':'MAX_ATTEMPTS', count: MAX_ATTEMPTS, geo:null}; sendTelegramBlock(payload).catch(()=>{}); sendBlockEmail(payload).catch(()=>{});}catch{} return {locked:true,duration:d}; } const p=getPool(); await Promise.all(keys.map(async k=>{ const r=recs[keys.indexOf(k)]; const fails=(r?.failed_attempts||0)+1; await p.query(`INSERT INTO lockouts (lock_key,failed_attempts,last_attempt_at) VALUES (?,?,NOW()) ON DUPLICATE KEY UPDATE failed_attempts=?, last_attempt_at=NOW()`,[k,fails,fails]).catch(()=>{}); })); return {locked:false,duration:BASE_LOCKOUT_MS}; }
+async function incrementFail(keys:string[],fp?:string,ip?:string){ if(!keys.length) return {locked:false,duration:BASE_LOCKOUT_MS}; await ensureTable(); const recs=await Promise.all(keys.map(k=>getRecord(k).catch(()=>null))); const shouldLock=recs.some(r=>((r?.failed_attempts||0)+1)>=MAX_ATTEMPTS); if(shouldLock){ const d=await lockKeys(keys,fp,ip); const ipKey=ip||"unknown"; const payload={ip:ipKey, subnet: (ipKey&&ipKey!=="unknown")? (getSubnet(ipKey)+".0/24"): "unknown", fingerprint:fp||keys[0]||"", deviceId:"", browser:"", os:"", reason: d>BASE_LOCKOUT_MS?'REPEAT_LOCKOUT':'MAX_ATTEMPTS', count: MAX_ATTEMPTS, geo:null}; console.log('[Lock] shouldLock=true, wysyłam alerty dla', ipKey, payload.reason); sendTelegramBlock(payload).then(ok=>console.log('[Telegram] wynik alertu blokady:', ok)).catch(e=>console.error('[Telegram] nieoczekiwany błąd promise', e)); sendBlockEmail(payload).catch(e=>console.error('[Email] alert blokady nie powiódł się (ignorowane, mail jest opcjonalny)', e?.message||e)); return {locked:true,duration:d}; } const p=getPool(); await Promise.all(keys.map(async k=>{ const r=recs[keys.indexOf(k)]; const fails=(r?.failed_attempts||0)+1; await p.query(`INSERT INTO lockouts (lock_key,failed_attempts,last_attempt_at) VALUES (?,?,NOW()) ON DUPLICATE KEY UPDATE failed_attempts=?, last_attempt_at=NOW()`,[k,fails,fails]).catch(()=>{}); })); return {locked:false,duration:BASE_LOCKOUT_MS}; }
 const lastErrors: Array<{ts:string,where:string,msg:string,stack?:string}> = [];
 function pushError(where:string, err:any){ try{ const m=err?.message||String(err); const e={ts:new Date().toISOString(), where, msg:String(m).slice(0,600), stack: (err?.stack||"").slice(0,1200)}; lastErrors.unshift(e as any); if(lastErrors.length>25) lastErrors.pop(); console.error(`[${where}]`,err);}catch{} }
 
@@ -389,6 +398,13 @@ export const adminRouter = router({
   clearErrors: publicProcedure.mutation(async()=>{ lastErrors.length=0; return {ok:true}; }),
   getMyIp: publicProcedure.query(async({ctx})=>{ const ip=getClientIp(ctx.req); const geo=await fetchGeoFast(ip,ctx.req); return {ip,subnet:getSubnet(ip),geo,headers:{'x-forwarded-for':ctx.req.headers?.['x-forwarded-for'],'cf-connecting-ip':ctx.req.headers?.['cf-connecting-ip']}}; }),
   getUserProfile: publicProcedure.input(z.object({ipAddress:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional()}).optional()).query(async()=>{ return null; }),
+  testTelegram: publicProcedure.mutation(async({ctx})=>{
+    const ip=getClientIp(ctx.req)||"unknown";
+    const payload={ip, subnet:(ip&&ip!=="unknown")?(getSubnet(ip)+".0/24"):"unknown", fingerprint:"test-fingerprint", deviceId:"test-device", browser:"TestBrowser", os:"TestOS", reason:"MANUAL_TEST", count:0, geo:null};
+    console.log('[Telegram] testTelegram wywołany ręcznie z panelu, ip=', ip);
+    const ok=await sendTelegramBlock(payload);
+    return {ok, envPresent:{token:!!process.env.TELEGRAM_BOT_TOKEN, chatId:!!process.env.TELEGRAM_CHAT_ID}, ip};
+  }),
 });
 
 export const appRouter = router({ angle: angleRouter, admin: adminRouter, status: angleRouter.status, getStatus: angleRouter.getStatus, verify: angleRouter.verify, });
