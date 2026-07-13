@@ -16,6 +16,49 @@ let pool: mysql.Pool | null = null;
 function getPool(){ if(pool) return pool; const raw=process.env.DATABASE_URL; if(!raw) throw new Error("Brak DATABASE_URL"); const u=new URL(raw); pool=mysql.createPool({host:u.hostname,port:Number(u.port||3306),user:decodeURIComponent(u.username),password:decodeURIComponent(u.password),database:u.pathname.replace(/^\//,"")||"defaultdb",ssl:{rejectUnauthorized:false} as any,waitForConnections:true,connectionLimit:10}); return pool; }
 
 let tablesEnsured = false;
+
+// ===== EMAIL ALERT =====
+let _mailer:any=null;
+function getMailer(){
+  try{
+    if(_mailer) return _mailer;
+    const host=process.env.SMTP_HOST||process.env.MAIL_HOST||"";
+    const port=parseInt(process.env.SMTP_PORT||process.env.MAIL_PORT||"587",10);
+    const user=process.env.SMTP_USER||process.env.MAIL_USER||process.env.SMTP_USERNAME||"";
+    const pass=process.env.SMTP_PASS||process.env.MAIL_PASS||process.env.SMTP_PASSWORD||"";
+    if(!host||!user||!pass) return null;
+    _mailer = nodemailer.createTransport({host,port,secure:port===465,auth:{user,pass}});
+    return _mailer;
+  }catch(e:any){ pushError('getMailer',e); return null; }
+}
+async function sendBlockEmail(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
+  try{
+    const to = process.env.ALERT_EMAIL_TO || process.env.ADMIN_EMAIL || process.env.SMTP_USER || "";
+    const from = process.env.ALERT_EMAIL_FROM || process.env.SMTP_USER || `noreply@kratownica.local`;
+    if(!to){ pushError('sendBlockEmail no recipient','set ALERT_EMAIL_TO'); return; }
+    const mailer=getMailer(); if(!mailer){ pushError('sendBlockEmail no mailer','set SMTP_HOST/USER/PASS'); return; }
+    const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
+    const subject=`[ALERT] Zablokowano ${opts.ip} - ${opts.reason||'przekroczono proby'}`;
+    const html=`
+      <div style="font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;border-radius:12px">
+        <h2 style="color:#f87171;margin:0 0 12px">🚨 Zablokowano urządzenie / IP</h2>
+        <p style="color:#94a3b8;margin:0 0 16px">Czas: <b>${now}</b> (Europe/Warsaw)</p>
+        <table style="width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden">
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">IP</td><td style="padding:10px;border-bottom:1px solid #334155"><b>${opts.ip}</b></td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Subnet</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.subnet||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Fingerprint</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.fingerprint||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">DeviceId</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.deviceId||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Przeglądarka / OS</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.browser||''} / ${opts.os||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Powód</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.reason||'MAX_ATTEMPTS przekroczone'}</td></tr>
+          <tr><td style="padding:10px;">Próby</td><td style="padding:10px;">${opts.count||'?'}</td></tr>
+        </table>
+        <p style="margin:16px 0 0"><a href="${process.env.APP_URL||'https://kratownica-checker-render.onrender.com'}/admin" style="display:inline-block;background:#ef4444;color:white;padding:10px 16px;border-radius:8px;text-decoration:none">Otwórz Panel Admina</a></p>
+        <p style="color:#64748b;font-size:12px;margin-top:16px">Geo: ${opts.geo?JSON.stringify(opts.geo):''}</p>
+      </div>`;
+    await mailer.sendMail({from,to,subject,html});
+  }catch(e:any){ pushError('sendBlockEmail',e); }
+}
+
 async function ensureTable(){
   if(tablesEnsured) return;
   const p=getPool();
@@ -45,54 +88,120 @@ function isPrivateIp(ip:string){ return ip==="127.0.0.1"||ip==="0.0.0.0"||ip.sta
 function getSubnet(ip:string){ ip=normalizeIp(ip); if(!isIPv4(ip)) return ip; return ip.split(".").slice(0,3).join("."); }
 function getSubnetKey(ip:string){ return `subnet:${getSubnet(ip)}`; }
 function isMullvadRange(ip:string){ return normalizeIp(ip).startsWith("185.132.178."); }
+function getRawHeader(req:any, name:string):string{
+  try{
+    const h:any=req?.headers||{};
+    let v = h[name] || h[name.toLowerCase()] || h[name.toUpperCase()];
+    if(!v && typeof h.get==='function'){ try{ v=h.get(name)||h.get(name.toLowerCase()); }catch{} }
+    if(Array.isArray(v)) v=v[0];
+    return String(v||"").replace(/^"|"$/g,"").trim();
+  }catch{ return ""; }
+}
 function parseOsFromUA(ua:string):string{
   if(!ua) return "";
-  const s=ua.toLowerCase().replace(/"/g,"").trim();
-  if(s.includes("windows")) return "Windows"; // catches "windows", "windows nt 10", "windows nt 11", quoted "Windows" from sec-ch-ua-platform
-  if(s.includes("mac os x")||s.includes("macintosh")||s.includes("macos")) return "macOS";
-  if(s.includes("android")) return "Android";
-  if(s.includes("iphone")||s.includes("ipad")||s.includes("ios")) return "iOS";
-  if(s.includes("cros")) return "Chrome OS";
-  if(s.includes("linux")) return "Linux";
+  let s=String(ua).toLowerCase().replace(/"/g,"").trim();
+  if(!s) return "";
+  if(s.includes("windows nt 10")||s.includes("windows nt 11")||s.includes("windows")||s==="windows") return "Windows";
+  if(s.includes("mac os x")||s.includes("macintosh")||s.includes("macos")||s==="macos"||s==="mac os") return "macOS";
+  if(s.includes("android")||s==="android") return "Android";
+  if(s.includes("iphone")||s.includes("ipad")||s.includes("ios")||s==="ios") return "iOS";
+  if(s.includes("linux")||s==="linux") return "Linux";
+  if(s.includes("cros")||s.includes("chrome os")||s==="chrome os") return "Chrome OS";
   return "";
 }
-// Render sometimes hands us a Fetch-standard Headers instance instead of a
-// plain object (h["user-agent"] silently returns undefined in that case).
-// This tries every access pattern: plain-object keys in a few cases, and
-// the Headers.get() method if present. Also unwraps arrays and strips
-// stray quotes (sec-ch-ua-platform values look like `"Windows"`).
-function getRawHeader(req:any, name:string): string {
-  if(!req) return "";
-  const h:any = req.headers;
-  if(!h) return "";
-  const clean = (v:any):string => {
-    const val = Array.isArray(v) ? v[0] : v;
-    if(val==null) return "";
-    return String(val).replace(/^"+|"+$/g,"").trim();
-  };
-  const tryKeys = [name, name.toLowerCase(), name.toUpperCase()];
-  for(const k of tryKeys){
-    if(h[k]!=null){ const v=clean(h[k]); if(v) return v; }
-  }
-  if(typeof h.get === "function"){
-    try{
-      const v = h.get(name) ?? h.get(name.toLowerCase());
-      if(v!=null){ const c=clean(v); if(c) return c; }
-    }catch{}
-  }
+function detectOs(req:any, fallbackBrowser?:string):string{
+  // 1. explicit sec-ch-ua-platform (most reliable on modern Chrome)
+  const plat = getRawHeader(req, "sec-ch-ua-platform") || getRawHeader(req, "Sec-CH-UA-Platform");
+  const fromPlat = parseOsFromUA(plat);
+  if(fromPlat) return fromPlat;
+  // 2. full User-Agent
+  const ua = getRawHeader(req, "user-agent") || getRawHeader(req, "User-Agent") || String(fallbackBrowser||"");
+  const fromUA = parseOsFromUA(ua);
+  if(fromUA) return fromUA;
+  // 3. last resort - if browser is Chrome and no info, assume Windows (najczęstszy u Ciebie)
   return "";
 }
-// 1) Client Hints platform header (most reliable when present, e.g. Chrome
-//    sends `sec-ch-ua-platform: "Windows"`), 2) classic User-Agent parsing,
-// 3) whatever browser name string the frontend sent, as a last resort.
-function detectOs(req:any, fallbackBrowser?:string): string {
-  const platform = getRawHeader(req, "sec-ch-ua-platform");
-  if(platform){ const p=parseOsFromUA(platform); if(p) return p; }
-  const ua = getRawHeader(req, "user-agent");
-  if(ua){ const p=parseOsFromUA(ua); if(p) return p; }
-  if(fallbackBrowser){ const p=parseOsFromUA(fallbackBrowser); if(p) return p; }
-  return "";
+
+
+async function sendTelegramBlock(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
+  try{
+    const token=(process.env.TELEGRAM_BOT_TOKEN||"").trim();
+    const chatId=(process.env.TELEGRAM_CHAT_ID||"").trim();
+    if(!token||!chatId) return false;
+    const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
+    const appUrl=(process.env.APP_URL||'https://kratownica-checker-render.onrender.com').replace(/\/$/,"");
+    const geoStr = opts.geo ? `${opts.geo.city||''} ${opts.geo.country||''} ${opts.geo.isp||''}`.trim() : (opts.subnet||'');
+    const msg = `🚨 <b>ZABLOKOWANO</b>\n\n<b>IP:</b> <code>${opts.ip}</code>\n<b>Subnet:</b> <code>${opts.subnet||''}</code>\n<b>Powód:</b> ${opts.reason||'MAX_ATTEMPTS'}\n<b>Próby:</b> ${opts.count||'?'} \n<b>Czas:</b> ${now}\n\n<b>Fingerprint:</b> <code>${(opts.fingerprint||'').slice(0,16)}...</code>\n<b>Device:</b> <code>${(opts.deviceId||'').slice(0,16)}...</code>\n<b>Browser/OS:</b> ${opts.browser||'?'} / ${opts.os||'?'} \n<b>Geo:</b> ${geoStr}\n\n<a href="${appUrl}/admin">👉 Otwórz Panel Admina</a>`;
+    const url=`https://api.telegram.org/bot${token}/sendMessage`;
+    const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text:msg,parse_mode:"HTML",disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"🔓 Otwórz Admin",url:`${appUrl}/admin`}]]}})});
+    if(!r.ok){ const t=await r.text().catch(()=>"?"); pushError('telegram failed',t); return false; }
+    return true;
+  }catch(e:any){ pushError('sendTelegramBlock',e); return false; }
 }
+
+// ===== EMAIL ALERT V18B - NO NPM REQUIRED (Resend + dynamic nodemailer fallback) =====
+let _mailer:any=null;
+async function getMailerDynamic(){
+  try{
+    const mod = await import("nodemailer").catch(()=>null) as any;
+    if(!mod) return null;
+    const nodemailer = mod.default || mod;
+    const host=process.env.SMTP_HOST||process.env.MAIL_HOST||"";
+    const port=parseInt(process.env.SMTP_PORT||process.env.MAIL_PORT||"587",10);
+    const user=process.env.SMTP_USER||process.env.MAIL_USER||process.env.SMTP_USERNAME||"";
+    const pass=process.env.SMTP_PASS||process.env.MAIL_PASS||process.env.SMTP_PASSWORD||"";
+    if(!host||!user||!pass) return null;
+    if(_mailer) return _mailer;
+    _mailer = nodemailer.createTransport({host,port,secure:port===465,auth:{user,pass}});
+    return _mailer;
+  }catch(e:any){ pushError('getMailerDynamic',e); return null; }
+}
+async function sendBlockEmail(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
+  try{
+    const to = (process.env.ALERT_EMAIL_TO || process.env.ADMIN_EMAIL || process.env.SMTP_USER || "").trim();
+    const from = (process.env.ALERT_EMAIL_FROM || process.env.SMTP_USER || `Kratownica Alert <onboarding@resend.dev>`).trim();
+    if(!to){ pushError('sendBlockEmail no recipient','set ALERT_EMAIL_TO'); return; }
+    const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
+    const subject=`[ALERT] Zablokowano ${opts.ip} - ${opts.reason||'przekroczono proby'}`;
+    const html=`
+      <div style="font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;border-radius:12px">
+        <h2 style="color:#f87171;margin:0 0 12px">🚨 Zablokowano urządzenie / IP</h2>
+        <p style="color:#94a3b8;margin:0 0 16px">Czas: <b>${now}</b> (Europe/Warsaw)</p>
+        <table style="width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden">
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">IP</td><td style="padding:10px;border-bottom:1px solid #334155"><b>${opts.ip}</b></td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Subnet</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.subnet||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Fingerprint</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.fingerprint||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">DeviceId</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.deviceId||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Przeglądarka / OS</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.browser||''} / ${opts.os||''}</td></tr>
+          <tr><td style="padding:10px;border-bottom:1px solid #334155">Powód</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.reason||'MAX_ATTEMPTS przekroczone'}</td></tr>
+          <tr><td style="padding:10px;">Próby</td><td style="padding:10px;">${opts.count||'?'}</td></tr>
+        </table>
+        <p style="margin:16px 0 0"><a href="${process.env.APP_URL||'https://kratownica-checker-render.onrender.com'}/admin" style="display:inline-block;background:#ef4444;color:white;padding:10px 16px;border-radius:8px;text-decoration:none">Otwórz Panel Admina</a></p>
+        <p style="color:#64748b;font-size:12px;margin-top:16px">Geo: ${opts.geo?JSON.stringify(opts.geo):''}</p>
+      </div>`;
+
+    // 1) Resend.com via fetch - ZERO zależności, darmowe 100 maili/dzien
+    const resendKey = process.env.RESEND_API_KEY;
+    if(resendKey){
+      try{
+        const r = await fetch("https://api.resend.com/emails",{method:"POST",headers:{Authorization:`Bearer ${resendKey}`,"Content-Type":"application/json"},body:JSON.stringify({from,to:[to],subject,html})});
+        if(r.ok) return;
+        const txt=await r.text().catch(()=>"?"); pushError('Resend failed',txt);
+      }catch(e:any){ pushError('Resend fetch',e); }
+    }
+
+    // 2) Fallback: SMTP via nodemailer jeśli zainstalowany
+    const mailer = await getMailerDynamic();
+    if(mailer){
+      await mailer.sendMail({from,to,subject,html});
+      return;
+    }
+
+    pushError('sendBlockEmail no transport','Ustaw RESEND_API_KEY lub SMTP_HOST/USER/PASS');
+  }catch(e:any){ pushError('sendBlockEmail',e); }
+}
+
+
 function parseCookies(req:any):Record<string,string>{ const h=req.headers?.cookie||""; const o:Record<string,string>={}; h.split(";").forEach((p:string)=>{const [k,...v]=p.trim().split("="); if(k) o[k]=decodeURIComponent(v.join("="));}); return o; }
 function ensureDoubleCookie(ctx:any,id?:string){ const c=parseCookies(ctx.req); let cid=c[COOKIE_NAME]; let did=id || (ctx.req.headers?.["x-device-id"] as string) || cid; if(!cid){ cid=did||crypto.randomUUID(); try{ ctx.res?.setHeader?.("Set-Cookie",`${COOKIE_NAME}=${cid}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${60*60*24*365}`);}catch{} } if(!did) did=cid; return {deviceId:did!,cookieId:cid!}; }
 
@@ -248,7 +357,7 @@ async function getLockedFromDB(){ await ensureTable(); const [rows]=await getPoo
 export const angleRouter = router({
   status: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).query(async({ctx,input})=>{ const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0) return {isLocked:true,locked:true,remainingAttempts:0,attemptsLeft:0,remainingLockoutMs:rem,remainingMs:rem}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS; return {isLocked:false,locked:false,remainingAttempts:left,attemptsLeft:left,remainingLockoutMs:0,remainingMs:0,maxAttempts:MAX_ATTEMPTS}; }),
   getStatus: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).query(async({ctx,input})=>{ const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0) return {isLocked:true,locked:true,remainingAttempts:0,attemptsLeft:0,remainingLockoutMs:rem,remainingMs:rem}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS; return {isLocked:false,locked:false,remainingAttempts:left,attemptsLeft:left,remainingLockoutMs:0,remainingMs:0,maxAttempts:MAX_ATTEMPTS}; }),
-  verify: publicProcedure.input(z.object({angle:z.number(),fingerprint:z.string().optional(),deviceId:z.string().optional(),browser:z.string().optional(),os:z.string().optional()})).mutation(async({ctx,input})=>{ (ctx as any).user={id:1,openId:"public-user",name:"Gość",email:"guest@example.com",loginMethod:"public",role:"user",createdAt:new Date(),updatedAt:new Date(),lastSignedIn:new Date()} as any; const t0=Date.now(); const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const effectiveOs = (input.os && input.os.trim()) ? input.os.trim().slice(0,80) : (detectOs(ctx.req, input.browser) || "Windows"); const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0){ return {success:false,reason:"locked" as const,remainingLockoutMs:rem}; } const ok=Math.abs(input.angle-CORRECT_ANGLE)<=TOLERANCE; const vpnP=checkVpnAndUpdate(fp,ip); if(ok){ await clearLock(keys); const lid=await insertAttemptLog({ip,angle:input.angle,status:'success',browser:input.browser,fingerprint:fp,deviceId,os:effectiveOs}); if(lid) backfillGeo(lid,ip,ctx.req,input.browser,effectiveOs).catch(()=>{}); return {success:true,reason:"correct" as const, _ms:Date.now()-t0}; } else { const [vpnRes,incRes]=await Promise.all([vpnP, incrementFail(keys,fp,ip)]); const lid2=await insertAttemptLog({ip,angle:input.angle,status:incRes.locked?'locked':vpnRes.isVpn?'vpn':'fail',browser:input.browser,fingerprint:fp,deviceId,os:effectiveOs}); if(lid2) backfillGeo(lid2,ip,ctx.req,input.browser,effectiveOs).catch(()=>{}); if(incRes.locked) return {success:false,reason:"locked" as const,remainingLockoutMs:incRes.duration,remainingAttempts:0,isRepeat:incRes.duration===REPEAT_LOCKOUT_MS, _ms:Date.now()-t0}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS-1; return {success:false,reason:vpnRes.isVpn?"vpn_detected" as const:"invalid_angle" as const,remainingAttempts:left, _ms:Date.now()-t0}; } }),
+  verify: publicProcedure.input(z.object({angle:z.number(),fingerprint:z.string().optional(),deviceId:z.string().optional(),browser:z.string().optional(),os:z.string().optional()})).mutation(async({ctx,input})=>{ (ctx as any).user={id:1,openId:"public-user",name:"Gość",email:"guest@example.com",loginMethod:"public",role:"user",createdAt:new Date(),updatedAt:new Date(),lastSignedIn:new Date()} as any; const t0=Date.now(); const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const effectiveOs = (input.os && String(input.os).trim()) ? String(input.os).trim().slice(0,80) : (detectOs(ctx.req, input.browser) || parseOsFromUA(String(input.browser||"")) || "Windows"); const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0){ return {success:false,reason:"locked" as const,remainingLockoutMs:rem}; } const ok=Math.abs(input.angle-CORRECT_ANGLE)<=TOLERANCE; const vpnP=checkVpnAndUpdate(fp,ip); if(ok){ await clearLock(keys); const lid=await insertAttemptLog({ip,angle:input.angle,status:'success',browser:input.browser,fingerprint:fp,deviceId,os:effectiveOs}); if(lid) backfillGeo(lid,ip,ctx.req,input.browser,effectiveOs).catch(()=>{}); return {success:true,reason:"correct" as const, _ms:Date.now()-t0}; } else { const [vpnRes,incRes]=await Promise.all([vpnP, incrementFail(keys,fp,ip)]); const lid2=await insertAttemptLog({ip,angle:input.angle,status:incRes.locked?'locked':vpnRes.isVpn?'vpn':'fail',browser:input.browser,fingerprint:fp,deviceId,os:effectiveOs}); if(lid2) backfillGeo(lid2,ip,ctx.req,input.browser,effectiveOs).catch(()=>{}); if(incRes.locked) return {success:false,reason:"locked" as const,remainingLockoutMs:incRes.duration,remainingAttempts:0,isRepeat:incRes.duration===REPEAT_LOCKOUT_MS, _ms:Date.now()-t0}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS-1; return {success:false,reason:vpnRes.isVpn?"vpn_detected" as const:"invalid_angle" as const,remainingAttempts:left, _ms:Date.now()-t0}; } }),
 });
 
 
@@ -338,10 +447,10 @@ export const adminRouter = router({
   getAllBlocked: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
   getLockedIPs: publicProcedure.query(async()=>{ const d=await getLockedFromDB(); return d.map(x=>x.lock_key); }),
   getLockedDevices: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
-  history: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT id, ip, COALESCE(NULLIF(ip,''),fingerprint,device_id,'0.0.0.0') as display_ip, angle, status, COALESCE(NULLIF(browser,''),device_id,fingerprint,'-') as device, browser, fingerprint, device_id, os, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as Czas FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{}; const ip=r.ip||loc.query||loc.ip||r.display_ip; return {...r, ip, display_ip:ip, localization:r.localization, country:loc.country||"", city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null && loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, browser: r.browser||loc.browser||"", os:r.os||loc.os||"", osFamily:r.os||loc.os||"", system:r.os||loc.os||""}; }); }catch(e){ console.error(e); return [] as any; } }),
+  history: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query<any[]>(`SELECT id, ip, COALESCE(NULLIF(ip,''),fingerprint,device_id,'0.0.0.0') as display_ip, angle, status, COALESCE(NULLIF(browser,''),device_id,fingerprint,'-') as device, browser, fingerprint, device_id, os, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as Czas FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{}; const ip=r.ip||loc.query||loc.ip||r.display_ip; return {...r, ip, display_ip:ip, localization:r.localization, country:loc.country||"", city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null && loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, browser: r.browser||loc.browser||"", os:r.os||loc.os||"", osFamily:r.os||loc.os||""}; }); }catch(e){ console.error(e); return [] as any; } }),
   getLogs: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at, DATE_FORMAT(created_at,'%Y-%m-%d %H:%i:%s') as time FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; }catch{ return [] as any; } }),
   getHistory: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; }catch{ return [] as any; } }),
-  getAttempts: publicProcedure.input(z.object({limit:z.number().optional(),offset:z.number().optional()}).optional()).query(async({input})=>{ try{ await ensureTable(); const lim=input?.limit||100; const off=input?.offset||0; const [rows]=await getPool().query<any[]>(`SELECT id, ip, angle, status, browser, os, fingerprint, device_id, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`,[lim,off]); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{} const ip=r.ip||loc.query||loc.ip||""; const country=loc.country||""; const osVal=r.os||loc.os||""; return { id:r.id, ip, ipAddress:ip, angle:r.angle, status:r.status, isCorrect:r.status==='success'?1:0, browser:r.browser||loc.browser||"", browserFamily:r.browser||loc.browser||"", fingerprint:r.fingerprint||"", deviceId:r.device_id||r.fingerprint||"", device_id:r.device_id||"", country, countryCode:country, city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", latitude:loc.lat??null, longitude:loc.lon??null, lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null&&loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, localization:r.localization, created_at:r.created_at, createdAt:r.created_at, os:osVal, osFamily:osVal, system:osVal, deviceType:"desktop" }; }); }catch(e){ console.error(e); return [] as any; } }),
+  getAttempts: publicProcedure.input(z.object({limit:z.number().optional(),offset:z.number().optional()}).optional()).query(async({input})=>{ try{ await ensureTable(); const lim=input?.limit||100; const off=input?.offset||0; const [rows]=await getPool().query<any[]>(`SELECT id, ip, angle, status, browser, fingerprint, device_id, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`,[lim,off]); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{} const ip=r.ip||loc.query||loc.ip||""; const country=loc.country||""; return { id:r.id, ip, ipAddress:ip, angle:r.angle, status:r.status, isCorrect:r.status==='success'?1:0, browser:r.browser||loc.browser||"", browserFamily:r.browser||loc.browser||"", fingerprint:r.fingerprint||"", deviceId:r.device_id||r.fingerprint||"", device_id:r.device_id||"", country, countryCode:country, city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", latitude:loc.lat??null, longitude:loc.lon??null, lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null&&loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, localization:r.localization, created_at:r.created_at, createdAt:r.created_at, osFamily:"", deviceType:"desktop" }; }); }catch(e){ console.error(e); return [] as any; } }),
   getStats: publicProcedure.query(async()=>{ try{ await ensureTable(); const [a]=await getPool().query<any[]>(`SELECT COUNT(*) as total, SUM(status='success') as ok FROM attempt_logs`); const total=(a as any[])[0]?.total||0; const ok=(a as any[])[0]?.ok||0; const locked=(await getLockedFromDB()).length; return {totalAttempts:total, successfulAttempts:ok, failedAttempts:total-ok, currentlyLockedIps:locked, lockedIPs:locked, successRate: total?Math.round((ok/total)*100):0}; }catch{ return {totalAttempts:0,successfulAttempts:0,failedAttempts:0,currentlyLockedIps:0,successRate:0}; } }),
   getAdvancedAnalytics: publicProcedure.query(async()=>{ return {totalAttempts:0, geographicDistribution:[], deviceDistribution:[], repeatOffenders:[]}; }),
   unlockIp: publicProcedure.input(z.object({ipAddress:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional(),key:z.string().optional()}).or(z.string())).mutation(async({input})=>{ const o=typeof input==='string'?{key:input}:input as any; return await unblockCompletely({ip:o.ipAddress||o.ip, fingerprint:o.fingerprint, deviceId:o.deviceId, key:o.key||o.ipAddress||o.fingerprint||o.deviceId}); }),
