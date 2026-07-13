@@ -16,49 +16,6 @@ let pool: mysql.Pool | null = null;
 function getPool(){ if(pool) return pool; const raw=process.env.DATABASE_URL; if(!raw) throw new Error("Brak DATABASE_URL"); const u=new URL(raw); pool=mysql.createPool({host:u.hostname,port:Number(u.port||3306),user:decodeURIComponent(u.username),password:decodeURIComponent(u.password),database:u.pathname.replace(/^\//,"")||"defaultdb",ssl:{rejectUnauthorized:false} as any,waitForConnections:true,connectionLimit:10}); return pool; }
 
 let tablesEnsured = false;
-
-// ===== EMAIL ALERT =====
-let _mailer:any=null;
-function getMailer(){
-  try{
-    if(_mailer) return _mailer;
-    const host=process.env.SMTP_HOST||process.env.MAIL_HOST||"";
-    const port=parseInt(process.env.SMTP_PORT||process.env.MAIL_PORT||"587",10);
-    const user=process.env.SMTP_USER||process.env.MAIL_USER||process.env.SMTP_USERNAME||"";
-    const pass=process.env.SMTP_PASS||process.env.MAIL_PASS||process.env.SMTP_PASSWORD||"";
-    if(!host||!user||!pass) return null;
-    _mailer = nodemailer.createTransport({host,port,secure:port===465,auth:{user,pass}});
-    return _mailer;
-  }catch(e:any){ pushError('getMailer',e); return null; }
-}
-async function sendBlockEmail(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
-  try{
-    const to = process.env.ALERT_EMAIL_TO || process.env.ADMIN_EMAIL || process.env.SMTP_USER || "";
-    const from = process.env.ALERT_EMAIL_FROM || process.env.SMTP_USER || `noreply@kratownica.local`;
-    if(!to){ pushError('sendBlockEmail no recipient','set ALERT_EMAIL_TO'); return; }
-    const mailer=getMailer(); if(!mailer){ pushError('sendBlockEmail no mailer','set SMTP_HOST/USER/PASS'); return; }
-    const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
-    const subject=`[ALERT] Zablokowano ${opts.ip} - ${opts.reason||'przekroczono proby'}`;
-    const html=`
-      <div style="font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;border-radius:12px">
-        <h2 style="color:#f87171;margin:0 0 12px">🚨 Zablokowano urządzenie / IP</h2>
-        <p style="color:#94a3b8;margin:0 0 16px">Czas: <b>${now}</b> (Europe/Warsaw)</p>
-        <table style="width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden">
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">IP</td><td style="padding:10px;border-bottom:1px solid #334155"><b>${opts.ip}</b></td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Subnet</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.subnet||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Fingerprint</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.fingerprint||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">DeviceId</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.deviceId||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Przeglądarka / OS</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.browser||''} / ${opts.os||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Powód</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.reason||'MAX_ATTEMPTS przekroczone'}</td></tr>
-          <tr><td style="padding:10px;">Próby</td><td style="padding:10px;">${opts.count||'?'}</td></tr>
-        </table>
-        <p style="margin:16px 0 0"><a href="${process.env.APP_URL||'https://kratownica-checker-render.onrender.com'}/admin" style="display:inline-block;background:#ef4444;color:white;padding:10px 16px;border-radius:8px;text-decoration:none">Otwórz Panel Admina</a></p>
-        <p style="color:#64748b;font-size:12px;margin-top:16px">Geo: ${opts.geo?JSON.stringify(opts.geo):''}</p>
-      </div>`;
-    await mailer.sendMail({from,to,subject,html});
-  }catch(e:any){ pushError('sendBlockEmail',e); }
-}
-
 async function ensureTable(){
   if(tablesEnsured) return;
   const p=getPool();
@@ -122,24 +79,7 @@ function detectOs(req:any, fallbackBrowser?:string):string{
   return "";
 }
 
-
-async function sendTelegramBlock(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
-  try{
-    const token=(process.env.TELEGRAM_BOT_TOKEN||"").trim();
-    const chatId=(process.env.TELEGRAM_CHAT_ID||"").trim();
-    if(!token||!chatId) return false;
-    const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
-    const appUrl=(process.env.APP_URL||'https://kratownica-checker-render.onrender.com').replace(/\/$/,"");
-    const geoStr = opts.geo ? `${opts.geo.city||''} ${opts.geo.country||''} ${opts.geo.isp||''}`.trim() : (opts.subnet||'');
-    const msg = `🚨 <b>ZABLOKOWANO</b>\n\n<b>IP:</b> <code>${opts.ip}</code>\n<b>Subnet:</b> <code>${opts.subnet||''}</code>\n<b>Powód:</b> ${opts.reason||'MAX_ATTEMPTS'}\n<b>Próby:</b> ${opts.count||'?'} \n<b>Czas:</b> ${now}\n\n<b>Fingerprint:</b> <code>${(opts.fingerprint||'').slice(0,16)}...</code>\n<b>Device:</b> <code>${(opts.deviceId||'').slice(0,16)}...</code>\n<b>Browser/OS:</b> ${opts.browser||'?'} / ${opts.os||'?'} \n<b>Geo:</b> ${geoStr}\n\n<a href="${appUrl}/admin">👉 Otwórz Panel Admina</a>`;
-    const url=`https://api.telegram.org/bot${token}/sendMessage`;
-    const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text:msg,parse_mode:"HTML",disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"🔓 Otwórz Admin",url:`${appUrl}/admin`}]]}})});
-    if(!r.ok){ const t=await r.text().catch(()=>"?"); pushError('telegram failed',t); return false; }
-    return true;
-  }catch(e:any){ pushError('sendTelegramBlock',e); return false; }
-}
-
-// ===== EMAIL ALERT V18B - NO NPM REQUIRED (Resend + dynamic nodemailer fallback) =====
+// ===== ALERT V18D - Telegram + Resend (bez npm) =====
 let _mailer:any=null;
 async function getMailerDynamic(){
   try{
@@ -148,8 +88,8 @@ async function getMailerDynamic(){
     const nodemailer = mod.default || mod;
     const host=process.env.SMTP_HOST||process.env.MAIL_HOST||"";
     const port=parseInt(process.env.SMTP_PORT||process.env.MAIL_PORT||"587",10);
-    const user=process.env.SMTP_USER||process.env.MAIL_USER||process.env.SMTP_USERNAME||"";
-    const pass=process.env.SMTP_PASS||process.env.MAIL_PASS||process.env.SMTP_PASSWORD||"";
+    const user=process.env.SMTP_USER||process.env.MAIL_USER||"";
+    const pass=process.env.SMTP_PASS||process.env.MAIL_PASS||"";
     if(!host||!user||!pass) return null;
     if(_mailer) return _mailer;
     _mailer = nodemailer.createTransport({host,port,secure:port===465,auth:{user,pass}});
@@ -158,47 +98,30 @@ async function getMailerDynamic(){
 }
 async function sendBlockEmail(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
   try{
-    const to = (process.env.ALERT_EMAIL_TO || process.env.ADMIN_EMAIL || process.env.SMTP_USER || "").trim();
-    const from = (process.env.ALERT_EMAIL_FROM || process.env.SMTP_USER || `Kratownica Alert <onboarding@resend.dev>`).trim();
-    if(!to){ pushError('sendBlockEmail no recipient','set ALERT_EMAIL_TO'); return; }
+    const to=(process.env.ALERT_EMAIL_TO||process.env.ADMIN_EMAIL||"").trim();
+    if(!to) return;
+    const from=(process.env.ALERT_EMAIL_FROM||process.env.SMTP_USER||`Kratownica <onboarding@resend.dev>`).trim();
     const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
     const subject=`[ALERT] Zablokowano ${opts.ip} - ${opts.reason||'przekroczono proby'}`;
-    const html=`
-      <div style="font-family:system-ui,Arial;background:#0f172a;color:#e2e8f0;padding:24px;border-radius:12px">
-        <h2 style="color:#f87171;margin:0 0 12px">🚨 Zablokowano urządzenie / IP</h2>
-        <p style="color:#94a3b8;margin:0 0 16px">Czas: <b>${now}</b> (Europe/Warsaw)</p>
-        <table style="width:100%;border-collapse:collapse;background:#1e293b;border-radius:8px;overflow:hidden">
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">IP</td><td style="padding:10px;border-bottom:1px solid #334155"><b>${opts.ip}</b></td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Subnet</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.subnet||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Fingerprint</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.fingerprint||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">DeviceId</td><td style="padding:10px;border-bottom:1px solid #334155;font-family:monospace">${opts.deviceId||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Przeglądarka / OS</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.browser||''} / ${opts.os||''}</td></tr>
-          <tr><td style="padding:10px;border-bottom:1px solid #334155">Powód</td><td style="padding:10px;border-bottom:1px solid #334155">${opts.reason||'MAX_ATTEMPTS przekroczone'}</td></tr>
-          <tr><td style="padding:10px;">Próby</td><td style="padding:10px;">${opts.count||'?'}</td></tr>
-        </table>
-        <p style="margin:16px 0 0"><a href="${process.env.APP_URL||'https://kratownica-checker-render.onrender.com'}/admin" style="display:inline-block;background:#ef4444;color:white;padding:10px 16px;border-radius:8px;text-decoration:none">Otwórz Panel Admina</a></p>
-        <p style="color:#64748b;font-size:12px;margin-top:16px">Geo: ${opts.geo?JSON.stringify(opts.geo):''}</p>
-      </div>`;
-
-    // 1) Resend.com via fetch - ZERO zależności, darmowe 100 maili/dzien
-    const resendKey = process.env.RESEND_API_KEY;
+    const html=`<div style="font-family:system-ui;background:#0f172a;color:#e2e8f0;padding:24px;border-radius:12px"><h2 style="color:#f87171">🚨 Zablokowano ${opts.ip}</h2><p>${now} | ${opts.reason}</p><p>Subnet ${opts.subnet} | FP ${opts.fingerprint} | Device ${opts.deviceId}</p><p><a href="${process.env.APP_URL||''}/admin" style="color:#38bdf8">Admin</a></p></div>`;
+    const resendKey=process.env.RESEND_API_KEY;
     if(resendKey){
-      try{
-        const r = await fetch("https://api.resend.com/emails",{method:"POST",headers:{Authorization:`Bearer ${resendKey}`,"Content-Type":"application/json"},body:JSON.stringify({from,to:[to],subject,html})});
-        if(r.ok) return;
-        const txt=await r.text().catch(()=>"?"); pushError('Resend failed',txt);
-      }catch(e:any){ pushError('Resend fetch',e); }
+      try{ const r=await fetch("https://api.resend.com/emails",{method:"POST",headers:{Authorization:`Bearer ${resendKey}`,"Content-Type":"application/json"},body:JSON.stringify({from,to:[to],subject,html})}); if(r.ok) return; }catch{}
     }
-
-    // 2) Fallback: SMTP via nodemailer jeśli zainstalowany
-    const mailer = await getMailerDynamic();
-    if(mailer){
-      await mailer.sendMail({from,to,subject,html});
-      return;
-    }
-
-    pushError('sendBlockEmail no transport','Ustaw RESEND_API_KEY lub SMTP_HOST/USER/PASS');
+    const mailer=await getMailerDynamic(); if(mailer){ await mailer.sendMail({from,to,subject,html}); }
   }catch(e:any){ pushError('sendBlockEmail',e); }
+}
+async function sendTelegramBlock(opts:{ip:string, subnet:string, fingerprint:string, deviceId:string, browser?:string, os?:string, reason?:string, count?:number, geo?:any}){
+  try{
+    const token=(process.env.TELEGRAM_BOT_TOKEN||"").trim();
+    const chatId=(process.env.TELEGRAM_CHAT_ID||"").trim();
+    if(!token||!chatId) return false;
+    const now=new Date().toLocaleString('pl-PL',{timeZone:'Europe/Warsaw'});
+    const appUrl=(process.env.APP_URL||'https://kratownica-checker-render.onrender.com').replace(/\/$/,"");
+    const msg=`🚨 <b>ZABLOKOWANO</b>\n\n<b>IP:</b> <code>${opts.ip}</code>\n<b>Subnet:</b> <code>${opts.subnet}</code>\n<b>Powód:</b> ${opts.reason||'MAX_ATTEMPTS'}\n<b>Próby:</b> ${opts.count||'?'} \n<b>Czas:</b> ${now}\n\n<b>FP:</b> <code>${(opts.fingerprint||'').slice(0,20)}...</code>\n<b>Browser:</b> ${opts.browser||'?'} / ${opts.os||'?'} \n\n<a href="${appUrl}/admin">👉 Otwórz Panel</a>`;
+    const r=await fetch(`https://api.telegram.org/bot${token}/sendMessage`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chat_id:chatId,text:msg,parse_mode:"HTML",disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:"🔓 Otwórz Admin",url:`${appUrl}/admin`}]]}})});
+    return r.ok;
+  }catch(e:any){ pushError('sendTelegramBlock',e); return false; }
 }
 
 
