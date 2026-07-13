@@ -214,6 +214,85 @@ export const angleRouter = router({
   verify: publicProcedure.input(z.object({angle:z.number(),fingerprint:z.string().optional(),deviceId:z.string().optional(),browser:z.string().optional(),os:z.string().optional()})).mutation(async({ctx,input})=>{ (ctx as any).user={id:1,openId:"public-user",name:"Gość",email:"guest@example.com",loginMethod:"public",role:"user",createdAt:new Date(),updatedAt:new Date(),lastSignedIn:new Date()} as any; const t0=Date.now(); const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const ua=(ctx.req.headers?.["user-agent"] as string)||input.browser||""; const effectiveOs = (input.os && input.os.trim()) ? input.os.trim().slice(0,80) : parseOsFromUA(ua); const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; const rem=await getRemainingMax(keys); if(rem>0){ return {success:false,reason:"locked" as const,remainingLockoutMs:rem}; } const ok=Math.abs(input.angle-CORRECT_ANGLE)<=TOLERANCE; const vpnP=checkVpnAndUpdate(fp,ip); if(ok){ await clearLock(keys); const lid=await insertAttemptLog({ip,angle:input.angle,status:'success',browser:input.browser,fingerprint:fp,deviceId,os:effectiveOs}); if(lid) backfillGeo(lid,ip,ctx.req,input.browser,effectiveOs).catch(()=>{}); return {success:true,reason:"correct" as const, _ms:Date.now()-t0}; } else { const [vpnRes,incRes]=await Promise.all([vpnP, incrementFail(keys,fp,ip)]); const lid2=await insertAttemptLog({ip,angle:input.angle,status:incRes.locked?'locked':vpnRes.isVpn?'vpn':'fail',browser:input.browser,fingerprint:fp,deviceId,os:effectiveOs}); if(lid2) backfillGeo(lid2,ip,ctx.req,input.browser,effectiveOs).catch(()=>{}); if(incRes.locked) return {success:false,reason:"locked" as const,remainingLockoutMs:incRes.duration,remainingAttempts:0,isRepeat:incRes.duration===REPEAT_LOCKOUT_MS, _ms:Date.now()-t0}; const rec=await getRecord(pk); const left=rec?Math.max(0,MAX_ATTEMPTS-rec.failed_attempts):MAX_ATTEMPTS-1; return {success:false,reason:vpnRes.isVpn?"vpn_detected" as const:"invalid_angle" as const,remainingAttempts:left, _ms:Date.now()-t0}; } }),
 });
 
+
+async function unblockCompletely(opts:{ip?:string,fingerprint?:string,deviceId?:string,key?:string}){
+  try{
+    await ensureTable(); const p=getPool();
+    const toDelete=new Set<string>();
+    const likes=new Set<string>();
+    const addLike=(v:string)=>{ if(v && v.length>=3) likes.add(v); };
+    const norm = (v:string)=>normalizeIp(v);
+
+    if(opts.key){
+      const k=String(opts.key).trim();
+      if(!k) return {ok:true};
+      toDelete.add(k);
+      addLike(k);
+      if(isIPv4(norm(k))){
+        const clean=norm(k);
+        const sub=getSubnet(clean);
+        const subKey=getSubnetKey(clean);
+        toDelete.add(clean); toDelete.add(sub); toDelete.add(subKey);
+        addLike(clean); addLike(sub); addLike(subKey);
+      } else if(k.startsWith("subnet:")){
+        const sub=k.replace("subnet:","").trim();
+        addLike(sub); addLike(k);
+        // also add all ips that start with this subnet
+        // will be handled by LIKE %sub%
+      } else {
+        // fingerprint / deviceId case - also try to find its last ip from device_networks
+        if(k.length>8) addLike(k.slice(0,12));
+      }
+    }
+    if(opts.ip){
+      const clean=norm(opts.ip);
+      const sub=getSubnet(clean);
+      const subKey=getSubnetKey(clean);
+      toDelete.add(clean); toDelete.add(sub); toDelete.add(subKey);
+      addLike(clean); addLike(sub); addLike(subKey);
+    }
+    if(opts.fingerprint){
+      const fp=String(opts.fingerprint).trim();
+      if(fp){ toDelete.add(fp); addLike(fp);
+        try{
+          const [rows]=await p.query<any[]>(`SELECT last_ip, last_subnet, first_subnet FROM device_networks WHERE fingerprint=?`,[fp]);
+          const r=(rows as any[])[0];
+          if(r?.last_ip){ const c=norm(r.last_ip); toDelete.add(c); addLike(c); addLike(getSubnet(c)); addLike(getSubnetKey(c)); }
+          if(r?.last_subnet){ addLike(r.last_subnet); addLike(`subnet:${r.last_subnet}`); toDelete.add(`subnet:${r.last_subnet}`); }
+          if(r?.first_subnet){ addLike(r.first_subnet); }
+        }catch{}
+      }
+    }
+    if(opts.deviceId){
+      const did=String(opts.deviceId).trim();
+      if(did){ toDelete.add(did); addLike(did); }
+    }
+
+    // 1. exact IN delete
+    if(toDelete.size){
+      const arr=[...toDelete].filter(Boolean);
+      const ph=arr.map(()=>'?').join(',');
+      await p.query(`DELETE FROM lockouts WHERE lock_key IN (${ph})`,arr).catch((e:any)=>pushError('unblockCompletely IN',e));
+    }
+    // 2. LIKE deletes for subnet/ip fragments
+    for(const pat of [...likes]){
+      if(!pat || pat.length<3) continue;
+      // avoid super generic like 'desktop'
+      if(pat==='desktop' || pat==='Chrome') continue;
+      await p.query(`DELETE FROM lockouts WHERE lock_key LIKE ?`,[`%${pat}%`]).catch(()=>{});
+    }
+    // 3. also clean device_networks for fingerprint
+    if(opts.fingerprint){
+      await p.query(`DELETE FROM device_networks WHERE fingerprint=?`,[opts.fingerprint]).catch(()=>{});
+    }
+    // 4. if ip provided, also clean any device_networks that have that ip as last_ip
+    if(opts.ip){
+      try{ const clean=norm(opts.ip); await p.query(`DELETE FROM device_networks WHERE last_ip=? OR first_ip=?`,[clean,clean]).catch(()=>{}); }catch{}
+    }
+    return {ok:true, cleared:[...toDelete], likes:[...likes]};
+  }catch(e:any){ pushError('unblockCompletely',e); return {ok:false, error:String(e?.message||e)}; }
+}
+
 export const adminRouter = router({
   verifyPin: publicProcedure.input(z.object({pin:z.string()})).mutation(async({input})=>{ if(input.pin===ADMIN_PIN) return {ok:true,success:true}; throw new Error("Nieprawidłowy PIN"); }),
   list: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
@@ -228,10 +307,10 @@ export const adminRouter = router({
   getAttempts: publicProcedure.input(z.object({limit:z.number().optional(),offset:z.number().optional()}).optional()).query(async({input})=>{ try{ await ensureTable(); const lim=input?.limit||100; const off=input?.offset||0; const [rows]=await getPool().query<any[]>(`SELECT id, ip, angle, status, browser, fingerprint, device_id, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`,[lim,off]); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{} const ip=r.ip||loc.query||loc.ip||""; const country=loc.country||""; return { id:r.id, ip, ipAddress:ip, angle:r.angle, status:r.status, isCorrect:r.status==='success'?1:0, browser:r.browser||loc.browser||"", browserFamily:r.browser||loc.browser||"", fingerprint:r.fingerprint||"", deviceId:r.device_id||r.fingerprint||"", device_id:r.device_id||"", country, countryCode:country, city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", latitude:loc.lat??null, longitude:loc.lon??null, lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null&&loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, localization:r.localization, created_at:r.created_at, createdAt:r.created_at, osFamily:"", deviceType:"desktop" }; }); }catch(e){ console.error(e); return [] as any; } }),
   getStats: publicProcedure.query(async()=>{ try{ await ensureTable(); const [a]=await getPool().query<any[]>(`SELECT COUNT(*) as total, SUM(status='success') as ok FROM attempt_logs`); const total=(a as any[])[0]?.total||0; const ok=(a as any[])[0]?.ok||0; const locked=(await getLockedFromDB()).length; return {totalAttempts:total, successfulAttempts:ok, failedAttempts:total-ok, currentlyLockedIps:locked, lockedIPs:locked, successRate: total?Math.round((ok/total)*100):0}; }catch{ return {totalAttempts:0,successfulAttempts:0,failedAttempts:0,currentlyLockedIps:0,successRate:0}; } }),
   getAdvancedAnalytics: publicProcedure.query(async()=>{ return {totalAttempts:0, geographicDistribution:[], deviceDistribution:[], repeatOffenders:[]}; }),
-  unlockIp: publicProcedure.input(z.object({ipAddress:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional(),key:z.string().optional()}).or(z.string())).mutation(async({input})=>{ await ensureTable(); const p=getPool(); const key=typeof input==='string'?input:(input as any).key||(input as any).ipAddress||(input as any).fingerprint||''; if(!key) return {success:false}; await clearLock([key]); await p.query(`DELETE FROM lockouts WHERE lock_key LIKE?`,[`%${key}%`]); return {success:true}; }),
-  unblock: publicProcedure.input(z.object({key:z.string().optional(),ip:z.string().optional(),fingerprint:z.string().optional()}).or(z.string())).mutation(async({input})=>{ await ensureTable(); const p=getPool(); const key=typeof input==='string'?input:(input.key||input.ip||input.fingerprint||''); if(!key) return {ok:true}; if(key.startsWith("subnet:")){ await p.query(`DELETE FROM lockouts WHERE lock_key=? OR lock_key LIKE?`,[key,`${key.replace("subnet:","")}.%`]); } else { await clearLock([key]); await p.query(`DELETE FROM lockouts WHERE lock_key LIKE?`,[`%${key}%`]); } return {ok:true}; }),
-  adminUnblock: publicProcedure.input(z.object({key:z.string()})).mutation(async({input})=>{ await clearLock([input.key]); return {ok:true}; }),
-  forceUnblockMe: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).mutation(async({ctx,input})=>{ const ip=getClientIp(ctx.req); const {deviceId,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; const sk=getSubnetKey(ip); const pk=fp||deviceId||cookieId||ip; const keys=[...new Set([pk,ip,sk,deviceId,cookieId,fp].filter(Boolean))] as string[]; await clearLock(keys); return {ok:true}; }),
+  unlockIp: publicProcedure.input(z.object({ipAddress:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional(),key:z.string().optional()}).or(z.string())).mutation(async({input})=>{ const o=typeof input==='string'?{key:input}:input as any; return await unblockCompletely({ip:o.ipAddress||o.ip, fingerprint:o.fingerprint, deviceId:o.deviceId, key:o.key||o.ipAddress||o.fingerprint||o.deviceId}); }),
+  unblock: publicProcedure.input(z.object({key:z.string().optional(),ip:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional()}).or(z.string())).mutation(async({input})=>{ const o=typeof input==='string'?{key:input}:input as any; return await unblockCompletely({ip:o.ip, fingerprint:o.fingerprint, deviceId:o.deviceId, key:o.key||o.ip||o.fingerprint}); }),
+  adminUnblock: publicProcedure.input(z.object({key:z.string()})).mutation(async({input})=>{ return await unblockCompletely({key:input.key}); }),
+  forceUnblockMe: publicProcedure.input(z.object({fingerprint:z.string().optional(),deviceId:z.string().optional()})).mutation(async({ctx,input})=>{ const ip=getClientIp(ctx.req); const {deviceId:did,cookieId}=ensureDoubleCookie(ctx,input.deviceId); const fp=input.fingerprint||""; return await unblockCompletely({ip, fingerprint:fp, deviceId:did||cookieId, key:fp||did||cookieId||ip}); }),
   clearAll: publicProcedure.mutation(async()=>{ await ensureTable(); const p=getPool(); await p.query(`DELETE FROM lockouts`); await p.query(`DELETE FROM device_networks`); await p.query(`DELETE FROM attempt_logs`); return {ok:true}; }),
   clearLogs: publicProcedure.mutation(async()=>{ await ensureTable(); await getPool().query(`DELETE FROM attempt_logs`); return {ok:true}; }),
   clearHistory: publicProcedure.mutation(async()=>{ await ensureTable(); await getPool().query(`DELETE FROM attempt_logs`); return {ok:true}; }),
