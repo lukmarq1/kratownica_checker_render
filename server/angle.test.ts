@@ -38,7 +38,7 @@ describe("Angle verification system", () => {
     it("should increment failed attempts on first failure", async () => {
       const testIp = "192.168.1.2";
       const result = await recordFailedAttempt(testIp);
-      expect(result.remainingAttempts).toBe(2);
+      expect(result.remainingAttempts).toBe(1);
       expect(result.isLocked).toBe(false);
     });
 
@@ -46,23 +46,21 @@ describe("Angle verification system", () => {
       const testIp = "192.168.1.3";
       await recordFailedAttempt(testIp);
       const result = await recordFailedAttempt(testIp);
-      expect(result.remainingAttempts).toBe(1);
-      expect(result.isLocked).toBe(false);
+      expect(result.remainingAttempts).toBe(0);
+      expect(result.isLocked).toBe(true);
     });
 
-    it("should lock after 3 failed attempts", async () => {
+    it("should lock after 2 failed attempts", async () => {
       const testIp = "192.168.1.4";
       await recordFailedAttempt(testIp);
       await recordFailedAttempt(testIp);
-      const result = await recordFailedAttempt(testIp);
-      expect(result.remainingAttempts).toBe(0);
-      expect(result.isLocked).toBe(true);
+      const result = await getOrCreateAttemptRecord(testIp);
+      expect(result.failedAttempts).toBe(2);
       expect(result.lockedUntil).toBeDefined();
     });
 
     it("should have 24-hour lockout duration", async () => {
       const testIp = "192.168.1.5";
-      await recordFailedAttempt(testIp);
       await recordFailedAttempt(testIp);
       const result = await recordFailedAttempt(testIp);
       
@@ -78,16 +76,15 @@ describe("Angle verification system", () => {
   });
 
   describe("Lockout status", () => {
-    it("should not be locked before 3 attempts", async () => {
+    it("should not be locked before 2 attempts", async () => {
       const testIp = "192.168.1.6";
       await recordFailedAttempt(testIp);
       const locked = await isIpLocked(testIp);
       expect(locked).toBe(false);
     });
 
-    it("should be locked after 3 attempts", async () => {
+    it("should be locked after 2 attempts", async () => {
       const testIp = "192.168.1.7";
-      await recordFailedAttempt(testIp);
       await recordFailedAttempt(testIp);
       await recordFailedAttempt(testIp);
       const locked = await isIpLocked(testIp);
@@ -96,7 +93,6 @@ describe("Angle verification system", () => {
 
     it("should return remaining lockout time", async () => {
       const testIp = "192.168.1.8";
-      await recordFailedAttempt(testIp);
       await recordFailedAttempt(testIp);
       await recordFailedAttempt(testIp);
       
@@ -126,7 +122,7 @@ describe("Angle verification system", () => {
       await resetAttempts(testIp);
       
       const result = await recordFailedAttempt(testIp);
-      expect(result.remainingAttempts).toBe(2);
+      expect(result.remainingAttempts).toBe(1);
       expect(result.isLocked).toBe(false);
     });
   });
@@ -152,7 +148,6 @@ describe("Angle verification system", () => {
       const ip2 = "192.168.1.14";
       
       // Lock IP1
-      await recordFailedAttempt(ip1);
       await recordFailedAttempt(ip1);
       await recordFailedAttempt(ip1);
       

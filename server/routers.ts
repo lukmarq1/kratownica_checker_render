@@ -2,6 +2,7 @@ import { z } from "zod";
 import { publicProcedure, router } from "./_core/trpc";
 import mysql from "mysql2/promise";
 import crypto from "crypto";
+import { COOKIE_NAME as SESSION_COOKIE_NAME } from "../shared/const";
 
 const MAX_ATTEMPTS = 2;
 const BASE_LOCKOUT_MS = 24 * 60 * 60 * 1000;
@@ -340,6 +341,20 @@ async function unblockCompletely(opts:{ip?:string,fingerprint?:string,deviceId?:
   }catch(e:any){ pushError('unblockCompletely',e); return {ok:false, error:String(e?.message||e)}; }
 }
 
+export const authRouter = router({
+  me: publicProcedure.query(({ ctx }) => ctx.user ?? null),
+  logout: publicProcedure.mutation(({ ctx }) => {
+    ctx.res.clearCookie(SESSION_COOKIE_NAME, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      path: "/",
+      maxAge: -1,
+    });
+    return { success: true } as const;
+  }),
+});
+
 export const adminRouter = router({
   verifyPin: publicProcedure.input(z.object({pin:z.string()})).mutation(async({input})=>{ if(input.pin===ADMIN_PIN) return {ok:true,success:true}; throw new Error("Nieprawidłowy PIN"); }),
   list: publicProcedure.query(async()=>{ return await getLockedFromDB(); }),
@@ -353,7 +368,57 @@ export const adminRouter = router({
   getHistory: publicProcedure.query(async()=>{ try{ await ensureTable(); const [rows]=await getPool().query(`SELECT id, ip, angle, status, browser as device, fingerprint, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`); return rows as any; }catch{ return [] as any; } }),
   getAttempts: publicProcedure.input(z.object({limit:z.number().optional(),offset:z.number().optional()}).optional()).query(async({input})=>{ try{ await ensureTable(); const lim=input?.limit||100; const off=input?.offset||0; const [rows]=await getPool().query<any[]>(`SELECT id, ip, angle, status, browser, fingerprint, device_id, localization, created_at FROM attempt_logs ORDER BY created_at DESC LIMIT ? OFFSET ?`,[lim,off]); return (rows as any[]).map(r=>{ let loc:any={}; try{ loc=r.localization?JSON.parse(r.localization):{}; }catch{} const ip=r.ip||loc.query||loc.ip||""; const country=loc.country||""; return { id:r.id, ip, ipAddress:ip, angle:r.angle, status:r.status, isCorrect:r.status==='success'?1:0, browser:r.browser||loc.browser||"", browserFamily:r.browser||loc.browser||"", fingerprint:r.fingerprint||"", deviceId:r.device_id||r.fingerprint||"", device_id:r.device_id||"", country, countryCode:country, city:loc.city||"", zip:loc.zip||"", timezone:loc.timezone||"", isp:loc.isp||loc.org||"", org:loc.org||"", as:loc.as||"", latitude:loc.lat??null, longitude:loc.lon??null, lat:loc.lat??null, lon:loc.lon??null, coords:(loc.lat!=null&&loc.lon!=null)?`${loc.lat},${loc.lon}`:"", region:loc.regionName||loc.region||"", query:loc.query||ip, localization:r.localization, created_at:r.created_at, createdAt:r.created_at, osFamily:"", deviceType:"desktop" }; }); }catch(e){ console.error(e); return [] as any; } }),
   getStats: publicProcedure.query(async()=>{ try{ await ensureTable(); const [a]=await getPool().query<any[]>(`SELECT COUNT(*) as total, SUM(status='success') as ok FROM attempt_logs`); const total=(a as any[])[0]?.total||0; const ok=(a as any[])[0]?.ok||0; const locked=(await getLockedFromDB()).length; return {totalAttempts:total, successfulAttempts:ok, failedAttempts:total-ok, currentlyLockedIps:locked, lockedIPs:locked, successRate: total?Math.round((ok/total)*100):0}; }catch{ return {totalAttempts:0,successfulAttempts:0,failedAttempts:0,currentlyLockedIps:0,successRate:0}; } }),
-  getAdvancedAnalytics: publicProcedure.query(async()=>{ return {totalAttempts:0, geographicDistribution:[], deviceDistribution:[], repeatOffenders:[]}; }),
+  getAdvancedAnalytics: publicProcedure.query(async() => {
+    type Offender = { id: string; ipAddress: string; country: string; totalAttempts: number; failedAttempts: number };
+    const empty = {
+      totalAttempts: 0,
+      successfulAttempts: 0,
+      failedAttempts: 0,
+      successRate: "0.00",
+      uniqueIps: 0,
+      geographicDistribution: [] as Array<{ country: string; count: number }>,
+      deviceDistribution: [] as Array<{ deviceType: string; count: number }>,
+      repeatOffenders: [] as Offender[],
+    };
+    try {
+      await ensureTable();
+      const [rows] = await getPool().query<any[]>(`SELECT ip, status, browser, device_id, localization FROM attempt_logs ORDER BY created_at DESC LIMIT 10000`);
+      const byIp = new Map<string, { total: number; failed: number; country: string }>();
+      const countries = new Map<string, number>();
+      const devices = new Map<string, number>();
+      for (const row of rows) {
+        const ip = String(row.ip || "unknown");
+        const entry = byIp.get(ip) || { total: 0, failed: 0, country: "Unknown" };
+        entry.total += 1;
+        if (row.status !== "success") entry.failed += 1;
+        try {
+          const location = row.localization ? JSON.parse(row.localization) : {};
+          entry.country = location.country || entry.country;
+          const country = location.country || "Unknown";
+          countries.set(country, (countries.get(country) || 0) + 1);
+        } catch {
+          countries.set("Unknown", (countries.get("Unknown") || 0) + 1);
+        }
+        const device = String(row.browser || row.device_id || "Unknown");
+        devices.set(device, (devices.get(device) || 0) + 1);
+        byIp.set(ip, entry);
+      }
+      const successfulAttempts = rows.filter(row => row.status === "success").length;
+      return {
+        totalAttempts: rows.length,
+        successfulAttempts,
+        failedAttempts: rows.length - successfulAttempts,
+        successRate: rows.length ? ((successfulAttempts / rows.length) * 100).toFixed(2) : "0.00",
+        uniqueIps: byIp.size,
+        geographicDistribution: [...countries.entries()].map(([country, count]) => ({ country, count })).sort((a, b) => b.count - a.count).slice(0, 10),
+        deviceDistribution: [...devices.entries()].map(([deviceType, count]) => ({ deviceType, count })).sort((a, b) => b.count - a.count),
+        repeatOffenders: [...byIp.entries()].filter(([, value]) => value.failed >= 2).map(([ipAddress, value]) => ({ id: ipAddress, ipAddress, country: value.country, totalAttempts: value.total, failedAttempts: value.failed })).slice(0, 20),
+      };
+    } catch (error) {
+      console.error("[getAdvancedAnalytics] Error:", error);
+      return empty;
+    }
+  }),
   unlockIp: publicProcedure.input(z.object({ipAddress:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional(),key:z.string().optional()}).or(z.string())).mutation(async({input})=>{ const o=typeof input==='string'?{key:input}:input as any; return await unblockCompletely({ip:o.ipAddress||o.ip, fingerprint:o.fingerprint, deviceId:o.deviceId, key:o.key||o.ipAddress||o.fingerprint||o.deviceId}); }),
   unblock: publicProcedure.input(z.object({key:z.string().optional(),ip:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional()}).or(z.string())).mutation(async({input})=>{ const o=typeof input==='string'?{key:input}:input as any; return await unblockCompletely({ip:o.ip, fingerprint:o.fingerprint, deviceId:o.deviceId, key:o.key||o.ip||o.fingerprint}); }),
   adminUnblock: publicProcedure.input(z.object({key:z.string()})).mutation(async({input})=>{ return await unblockCompletely({key:input.key}); }),
@@ -366,7 +431,34 @@ export const adminRouter = router({
   getLastErrors: publicProcedure.query(async()=>{ return lastErrors; }),
   clearErrors: publicProcedure.mutation(async()=>{ lastErrors.length=0; return {ok:true}; }),
   getMyIp: publicProcedure.query(async({ctx})=>{ const ip=getClientIp(ctx.req); const geo=await fetchGeoFast(ip,ctx.req); return {ip,subnet:getSubnet(ip),geo,headers:{'x-forwarded-for':ctx.req.headers?.['x-forwarded-for'],'cf-connecting-ip':ctx.req.headers?.['cf-connecting-ip']}}; }),
-  getUserProfile: publicProcedure.input(z.object({ipAddress:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional()}).optional()).query(async()=>{ return null; }),
+  getUserProfile: publicProcedure.input(z.object({ipAddress:z.string().optional(),fingerprint:z.string().optional(),deviceId:z.string().optional()}).optional()).query(async({input}) => {
+    if (!input?.ipAddress) return null;
+    try {
+      await ensureTable();
+      const [rows] = await getPool().query<any[]>(`SELECT id, ip, angle, status, browser, device_id, localization, created_at FROM attempt_logs WHERE ip=? ORDER BY created_at DESC LIMIT 100`, [input.ipAddress]);
+      if (!rows.length) return null;
+      const attempts = rows.map(row => ({
+        id: String(row.id),
+        angle: Number(row.angle || 0),
+        isCorrect: row.status === "success" ? 1 : 0,
+        createdAt: row.created_at,
+      }));
+      let location: any = {};
+      try { location = rows[0].localization ? JSON.parse(rows[0].localization) : {}; } catch { /* malformed geo is non-fatal */ }
+      return {
+        ipAddress: input.ipAddress,
+        country: location.country || "Unknown",
+        city: location.city || "Unknown",
+        isp: location.isp || location.org || "Unknown",
+        deviceType: rows[0].browser || rows[0].device_id || "Unknown",
+        attempts,
+        failedAttempts: attempts.filter(attempt => attempt.isCorrect !== 1).length,
+      };
+    } catch (error) {
+      console.error("[getUserProfile] Error:", error);
+      return null;
+    }
+  }),
   testTelegram: publicProcedure.mutation(async({ctx})=>{
     const ip=getClientIp(ctx.req)||"unknown";
     const payload={ip, subnet:(ip&&ip!=="unknown")?(getSubnet(ip)+".0/24"):"unknown", fingerprint:"test-fingerprint", deviceId:"test-device", browser:"TestBrowser", os:"TestOS", reason:"MANUAL_TEST", count:0, geo:null};
@@ -376,5 +468,5 @@ export const adminRouter = router({
   }),
 });
 
-export const appRouter = router({ angle: angleRouter, admin: adminRouter, status: angleRouter.status, getStatus: angleRouter.getStatus, verify: angleRouter.verify, });
+export const appRouter = router({ auth: authRouter, angle: angleRouter, admin: adminRouter, status: angleRouter.status, getStatus: angleRouter.getStatus, verify: angleRouter.verify, });
 export type AppRouter = typeof appRouter;

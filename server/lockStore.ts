@@ -149,5 +149,5 @@ export async function recordFailedAttempt(key: string, ip: string, fingerprint?:
 }
 
 export async function resetAttempts(keys: string[]) { const db = dbOrNull(); if (!db) { keys.forEach(k => memLocks.delete(k)); return; } try { for (const k of keys) await db.delete(lockKeys).where(eq(lockKeys.id, k)); } catch {} }
-export async function getLockedAll() { const db = dbOrNull(); if (!db) return Array.from(memLocks.entries()).filter(([, v]) => v.lockedUntil > Date.now()).map(([k]) => k); try { const rows = await db.select({ id: lockKeys.id }).from(lockKeys).where(sql`${lockKeys.lockedUntil} > NOW()`); return rows.map(r => r.id); } catch { return []; } }
+export async function getLockedAll() { const db = dbOrNull(); if (!db) return Array.from(memLocks.entries()).filter(([, v]) => v.lockedUntil > Date.now()).map(([k]) => k); try { const rows = await db.select({ id: lockKeys.id }).from(lockKeys).where(sql`${lockKeys.lockedUntil} > NOW()`); return rows.map((r: { id: string }) => r.id); } catch { return []; } }
 export async function unlockKeys(keys: string[]) { const db = dbOrNull(); if (!db) { keys.forEach(k => memLocks.delete(k)); return { deletedCount: keys.length }; } let count = 0; for (const k of keys) { try { await db.delete(lockKeys).where(eq(lockKeys.id, k)); count++; } catch {} } return { deletedCount: count }; }
