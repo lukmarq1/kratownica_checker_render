@@ -6,11 +6,24 @@ import {
   recordFailedAttempt,
   resetAttempts,
 } from "./db";
+import { ANGLE_TOLERANCE, CORRECT_ANGLE, isCorrectAngle } from "./angleValidation";
 
 // Mock database for testing
 const mockDb: Record<string, any> = {};
 
 describe("Angle verification system", () => {
+  describe("Angle threshold", () => {
+    it("accepts only 65° ± 0.5° and rejects 66°", () => {
+      expect(ANGLE_TOLERANCE).toBe(0.5);
+      expect(isCorrectAngle(CORRECT_ANGLE)).toBe(true);
+      expect(isCorrectAngle(64.5)).toBe(true);
+      expect(isCorrectAngle(65.5)).toBe(true);
+      expect(isCorrectAngle(64.49)).toBe(false);
+      expect(isCorrectAngle(65.51)).toBe(false);
+      expect(isCorrectAngle(66)).toBe(false);
+    });
+  });
+
   beforeEach(() => {
     // Reset mock data before each test
     Object.keys(mockDb).forEach((key) => delete mockDb[key]);
