@@ -1,5 +1,17 @@
 import { mysqlTable, varchar, int, datetime, tinyint, text, double } from "drizzle-orm/mysql-core";
 
+export type User = {
+  id: number;
+  openId: string;
+  name: string | null;
+  email: string | null;
+  loginMethod: string | null;
+  role: "admin" | "user";
+  createdAt: Date;
+  updatedAt: Date;
+  lastSignedIn: Date;
+};
+
 export const attemptHistory = mysqlTable("attempt_history", {
   id: varchar("id", { length: 191 }).primaryKey(),
   ipAddress: varchar("ipAddress", { length: 45 }).notNull(),
