@@ -67,7 +67,7 @@ async function startServer() {
   // --- FIX: Prawdziwa inicjalizacja bazy z obsługą Aiven ---
   try {
     const dbMod = await import("./db");
-    const getDb = dbMod.getDb || (dbMod.default && dbMod.default.getDb);
+    const getDb = dbMod.getDb;
     if (typeof getDb === "function") {
       const db = getDb();
       if (db) {
