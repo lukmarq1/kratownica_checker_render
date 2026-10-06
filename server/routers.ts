@@ -4,6 +4,7 @@ import mysql from "mysql2/promise";
 import crypto from "crypto";
 import { COOKIE_NAME as SESSION_COOKIE_NAME } from "../shared/const";
 import { isCorrectAngle } from "./angleValidation";
+import { detectFraudAlerts } from "./fraudDetection";
 
 const MAX_ATTEMPTS = 2;
 const BASE_LOCKOUT_MS = 24 * 60 * 60 * 1000;
@@ -378,6 +379,7 @@ export const adminRouter = router({
       geographicDistribution: [] as Array<{ country: string; count: number }>,
       deviceDistribution: [] as Array<{ deviceType: string; count: number }>,
       repeatOffenders: [] as Offender[],
+      fraudAlerts: [],
     };
     try {
       await ensureTable();
@@ -412,6 +414,7 @@ export const adminRouter = router({
         geographicDistribution: [...countries.entries()].map(([country, count]) => ({ country, count })).sort((a, b) => b.count - a.count).slice(0, 10),
         deviceDistribution: [...devices.entries()].map(([deviceType, count]) => ({ deviceType, count })).sort((a, b) => b.count - a.count),
         repeatOffenders: [...byIp.entries()].filter(([, value]) => value.failed >= 2).map(([ipAddress, value]) => ({ id: ipAddress, ipAddress, country: value.country, totalAttempts: value.total, failedAttempts: value.failed })).slice(0, 20),
+        fraudAlerts: detectFraudAlerts(rows),
       };
     } catch (error) {
       console.error("[getAdvancedAnalytics] Error:", error);
