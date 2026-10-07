@@ -14,6 +14,7 @@ import {
   Smartphone,
   Download,
   Search,
+  AlertTriangle,
 } from "lucide-react";
 import { useLocation } from "wouter";
 
@@ -230,6 +231,43 @@ export default function AdminDashboardEnhanced() {
                       </tr>
                     ))}
                   </tbody>
+                </table>
+              </div>
+            </div>
+          </Card>
+        </div>
+      )}
+
+      {/* Rapid identity changes */}
+      {analytics?.fraudAlerts && analytics.fraudAlerts.length > 0 && (
+        <div className="max-w-7xl mx-auto mb-8">
+          <Card className="bg-slate-800 border border-red-900/60">
+            <div className="p-6">
+              <div className="flex items-center gap-2 mb-2">
+                <AlertTriangle className="w-5 h-5 text-orange-400" />
+                <h2 className="text-xl font-bold font-mono text-slate-100">Szybkie zmiany tożsamości</h2>
+              </div>
+              <p className="text-sm text-slate-400 font-mono mb-4">
+                Ten sam fingerprint lub identyfikator pojawił się z różnych IP/urządzeń w ciągu ostatnich 10 minut.
+              </p>
+              <div className="overflow-x-auto">
+                <table className="w-full font-mono text-sm">
+                  <thead><tr className="border-b border-slate-700">
+                    <th className="text-left py-3 px-4 text-slate-400">Ryzyko</th>
+                    <th className="text-left py-3 px-4 text-slate-400">Identyfikator</th>
+                    <th className="text-left py-3 px-4 text-slate-400">IP</th>
+                    <th className="text-left py-3 px-4 text-slate-400">Urządzenia</th>
+                    <th className="text-left py-3 px-4 text-slate-400">Powód</th>
+                  </tr></thead>
+                  <tbody>{analytics.fraudAlerts.map((alert) => (
+                    <tr key={alert.id} className="border-b border-slate-700/70 align-top">
+                      <td className="py-3 px-4"><span className={alert.level === "critical" ? "text-red-400 font-bold" : alert.level === "high" ? "text-orange-400 font-bold" : "text-yellow-300"}>{alert.riskScore}/100</span></td>
+                      <td className="py-3 px-4 text-slate-300 break-all max-w-[180px]">{alert.identity.slice(0, 18)}…</td>
+                      <td className="py-3 px-4 text-slate-300">{alert.ips.join(", ")}</td>
+                      <td className="py-3 px-4 text-slate-300">{alert.devices.length}</td>
+                      <td className="py-3 px-4 text-slate-300">{alert.reasons.join("; ")}</td>
+                    </tr>
+                  ))}</tbody>
                 </table>
               </div>
             </div>
