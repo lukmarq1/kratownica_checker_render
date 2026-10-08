@@ -6,29 +6,41 @@ import { useState, useEffect, useMemo } from "react";
 import { CheckCircle2, Lock, ArrowRight } from "lucide-react";
 import { useLocation } from "wouter";
 
-// Generuje stabilny fingerprint - ten sam na WiFi i LTE na tym samym telefonie
-function generateFingerprint() {
+// Generuje stabilny, ale nieodwracalny skrót sygnałów przeglądarki.
+async function generateFingerprint(): Promise<string> {
   try {
     const nav = navigator as any;
+    let webgl = "";
+    try {
+      const canvas = document.createElement("canvas");
+      const gl = (canvas.getContext("webgl") || canvas.getContext("experimental-webgl")) as any;
+      const debug = gl?.getExtension("WEBGL_debug_renderer_info") as any;
+      webgl = debug ? `${gl?.getParameter(debug.UNMASKED_VENDOR_WEBGL)}|${gl?.getParameter(debug.UNMASKED_RENDERER_WEBGL)}` : "";
+    } catch { /* prywatne przeglądarki mogą blokować WebGL */ }
     const components = [
       navigator.userAgent,
       navigator.language,
+      (navigator.languages || []).join(","),
+      nav.vendor || "",
       `${screen.width}x${screen.height}x${screen.colorDepth}`,
+      `${screen.availWidth}x${screen.availHeight}`,
+      `${window.devicePixelRatio || 1}`,
       new Date().getTimezoneOffset().toString(),
       Intl.DateTimeFormat().resolvedOptions().timeZone || "",
       (nav.hardwareConcurrency || "").toString(),
       (nav.deviceMemory || "").toString(),
       (nav.platform || ""),
+      (nav.maxTouchPoints || 0).toString(),
+      webgl,
     ];
     const raw = components.join("|");
-    // prosty hash + base64 żeby był stabilny i krótki
-    let hash = 0;
-    for (let i = 0; i < raw.length; i++) {
-      hash = ((hash << 5) - hash + raw.charCodeAt(i)) | 0;
+    if (crypto.subtle) {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
+      const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      return `fp-${hex}`;
     }
-    const hashStr = Math.abs(hash).toString(16).padStart(8, "0");
-    const b64 = btoa(raw).slice(0, 24).replace(/[^a-zA-Z0-9]/g, "");
-    return `${hashStr}-${b64}`.toLowerCase();
+    let hash = 0; for (let i = 0; i < raw.length; i++) hash = ((hash << 5) - hash + raw.charCodeAt(i)) | 0;
+    return `fp-${Math.abs(hash).toString(16)}`;
   } catch {
     return "fp-fallback";
   }
@@ -63,7 +75,7 @@ export default function Home() {
 
   // wygeneruj raz po załadowaniu
   useEffect(() => {
-    setFingerprint(generateFingerprint());
+    generateFingerprint().then(setFingerprint);
     setDeviceId(getOrCreateDeviceId());
   }, []);
 
