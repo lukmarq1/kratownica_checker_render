@@ -5,6 +5,8 @@ import crypto from "crypto";
 import { COOKIE_NAME as SESSION_COOKIE_NAME } from "../shared/const";
 import { isCorrectAngle } from "./angleValidation";
 import { detectFraudAlerts } from "./fraudDetection";
+import { ENV } from "./_core/env";
+import { createDeviceId, readSignedDeviceId, signDeviceId } from "./deviceIdentity";
 
 const MAX_ATTEMPTS = 2;
 const BASE_LOCKOUT_MS = 24 * 60 * 60 * 1000;
@@ -105,7 +107,17 @@ async function sendTelegramBlock(opts:{ip:string, subnet:string, fingerprint:str
 
 
 function parseCookies(req:any):Record<string,string>{ const h=req.headers?.cookie||""; const o:Record<string,string>={}; h.split(";").forEach((p:string)=>{const [k,...v]=p.trim().split("="); if(k) o[k]=decodeURIComponent(v.join("="));}); return o; }
-function ensureDoubleCookie(ctx:any,id?:string){ const c=parseCookies(ctx.req); let cid=c[COOKIE_NAME]; let did=id || (ctx.req.headers?.["x-device-id"] as string) || cid; if(!cid){ cid=did||crypto.randomUUID(); try{ ctx.res?.setHeader?.("Set-Cookie",`${COOKIE_NAME}=${cid}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${60*60*24*365}`);}catch{} } if(!did) did=cid; return {deviceId:did!,cookieId:cid!}; }
+function ensureDoubleCookie(ctx:any,id?:string){
+  const c=parseCookies(ctx.req); const raw=c[COOKIE_NAME]||"";
+  const secret=ENV.cookieSecret || process.env.JWT_SECRET || "";
+  const verified=readSignedDeviceId(raw,secret);
+  // Validny cookie serwerowy jest nadrzedny. ID z klienta sluzy tylko przy
+  // pierwszej wizycie, po czym zostaje zastapione podpisanym tokenem.
+  const deviceId=verified || (!raw ? String(id || ctx.req.headers?.["x-device-id"] || "").trim() : "") || createDeviceId();
+  const signed=secret ? signDeviceId(deviceId,secret) : deviceId;
+  if(raw!==signed){ try{ ctx.res?.setHeader?.("Set-Cookie",`${COOKIE_NAME}=${signed}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${60*60*24*365}`);}catch{} }
+  return {deviceId, cookieId:deviceId, cookieTampered:!!raw && !verified};
+}
 
 type NormGeo = {country:string; city:string; zip:string; timezone:string; isp:string; org:string; as:string; lat:number|null; lon:number|null; query:string; regionName:string};
 
